@@ -220,9 +220,22 @@ def run_live(profile, neural):
 
 
 SURROUND_MAP = ",".join(CHANNELS)
+# These streams go through pipewire-pulse, which by default accepts up to 4 MB
+# before it starts dropping -- about 2.5 s of 8-channel audio. Whatever the DSP
+# does not consume in time waits in that buffer, and since we then read and play
+# at exactly real time, the offset never shrinks: one stall (first inference, a
+# page fault, a scene hitch at game start) leaves the sound seconds behind the
+# picture for the rest of the session. Cap the buffered audio instead, so a
+# stall costs a short dropout rather than permanent lag.
+RECORD_CAP = 65536   # bytes: 46 ms of 8-channel float32 at 44100
+PLAYBACK_CAP = 32768  # bytes: 93 ms of stereo float32 at 44100
+# A single block takes 2.9 ms, so a read that waits this long means the process
+# or the graph stalled and audio queued up somewhere behind us. That backlog is
+# stale by definition: re-open both ends instead of playing it late forever.
+STALL_SECONDS = 0.25
 COMMON = [
     "--raw", "--format=float32le", f"--rate={RATE}",
-    "--latency-msec=28", "--process-time-msec=4", "--client-name=Ally Sound Lab",
+    "--latency-msec=20", "--process-time-msec=4", "--client-name=Ally Sound Lab",
 ]
 
 
@@ -230,6 +243,7 @@ def open_playback(target):
     return subprocess.Popen(
         ["/usr/bin/pacat", "--playback", f"--device={target}", "--volume=65536",
          "--property=node.dont-reconnect=true", "--property=node.dont-move=true",
+         f"--property=pulse.attr.maxlength={PLAYBACK_CAP}",
          "--channels=2", "--channel-map=front-left,front-right", *COMMON],
         stdin=subprocess.PIPE,
         bufsize=0,
@@ -239,6 +253,7 @@ def open_playback(target):
 def open_record():
     return subprocess.Popen(
         ["/usr/bin/parec", f"--device={SINK}.monitor",
+         f"--property=pulse.attr.maxlength={RECORD_CAP}",
          f"--channels={len(CHANNELS)}", f"--channel-map={SURROUND_MAP}", *COMMON],
         stdout=subprocess.PIPE,
     )
@@ -296,6 +311,7 @@ def process_live(profile, neural):
     pipes = {"record": None, "playback": None}
     measured = missed = 0
     total = 0.0
+    last_resync = 0.0
     health_check = monotonic()
     finished = Event()
     disconnect = Event()
@@ -393,7 +409,14 @@ def process_live(profile, neural):
                     new_target = retarget.get_nowait()
                 if new_target != target:
                     route_to(new_target)
+            wait_started = monotonic()
             chunk = pipes["record"].stdout.read(chunk_bytes)
+            if monotonic() - wait_started > STALL_SECONDS and monotonic() - last_resync > 2:
+                # We were starved, so everything that arrived in the meantime is old
+                # news. Drop it and re-sync instead of running seconds behind.
+                last_resync = monotonic()
+                route_to(target)
+                continue
             if disconnect.is_set():
                 raise RuntimeError("PipeWire удалил аудиовыход Ally Sound Lab.")
             if len(chunk) != chunk_bytes:
@@ -419,10 +442,15 @@ def process_live(profile, neural):
             measured += 1
             missed += elapsed_ms > HOP / RATE * 1000
             total += elapsed_ms
+            write_started = monotonic()
             try:
                 written = pipes["playback"].stdin.write(result)
             except BrokenPipeError:
                 written = None
+            if written == len(result) and monotonic() - write_started > STALL_SECONDS:
+                # The player is sitting on a queue we cannot drain: start over.
+                route_to(target)
+                continue
             if written != len(result):
                 # The physical output vanished (e.g. headphones turned off).
                 # Give the route checker a moment to pick the fallback device.
