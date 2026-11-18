@@ -76,6 +76,10 @@
 
 ## Установка
 
+Нужны: Decky Loader, `uv` (`sudo pacman -S uv`), `curl`, `sha256sum`, PipeWire с `pactl`/`parec`/`pacat`. Коррекция динамиков Ally берётся из пакета `cachyos-handheld`, если он установлен.
+
+Без `install-runtime.sh` плагин покажет «Модели не установлены».
+
 На приставке, от обычного пользователя:
 
 ```bash
