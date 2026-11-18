@@ -50,8 +50,8 @@ STEREO_TRIM = 10 ** (4.4 / 20)
 DEVICES = ("headphones", "speakers", "glasses")
 # Loudness trims for the speaker virtualiser per source, calibrated against
 # bypass with tools/offline_render.py (replace the binaural trims).
-SPEAKER_TRIM = {"stereo": 10 ** (0.5 / 20), "surround": 10 ** (-1.5 / 20)}
-GLASSES_BASS_DB = 4.0
+SPEAKER_TRIM = {"stereo": 10 ** (-2.2 / 20), "surround": 10 ** (-8.0 / 20)}
+GLASSES_BASS_DB = 2.0  # x20-speaker-dsp found bass boost buzzes on small drivers
 
 
 def load_hrirs(path):
@@ -139,7 +139,8 @@ def load_speaker_correction(path, max_taps=16384):
     """Stereo FIR speaker correction (e.g. CachyOS' ROG Ally game.wav) as (2, 1, L).
 
     Resampled to RATE, cut where 99.9% of the energy is reached, faded out,
-    and normalised to unity gain at 1 kHz so loudness calibration still holds.
+    and normalised to unity average power gain over 150 Hz - 8 kHz (pink
+    weighting), so it reshapes the tone without making things louder.
     """
     from scipy.io import wavfile
 
@@ -156,9 +157,13 @@ def load_speaker_correction(path, max_taps=16384):
     data = data[:, :length].copy()
     fade = min(256, length // 4)
     data[:, -fade:] *= np.linspace(1, 0, fade)
-    spectrum = np.abs(np.fft.rfft(data, n=8192, axis=-1))
-    bin_1k = int(round(1000 * 8192 / RATE))
-    data /= spectrum[:, bin_1k:bin_1k + 1]
+    spectrum = np.abs(np.fft.rfft(data, n=8192, axis=-1)) ** 2
+    frequencies = np.fft.rfftfreq(8192, 1 / RATE)
+    band = (frequencies >= 150) & (frequencies <= 8000)
+    pink = 1 / frequencies[band]
+    gain = np.sum(spectrum[:, band] * pink, axis=-1) / np.sum(pink)
+    data /= np.sqrt(gain)[:, None]
+    data *= 10 ** (-2.0 / 20)  # its 150-500 Hz lift still reads ~2 dB louder (measured)
     return data[:, None, :].astype(np.float32)
 
 
@@ -185,37 +190,85 @@ class Delay:
 
 
 class Dynamics:
-    """Optional speech-friendly compressor followed by a peak limiter."""
+    """Leveler -> fast compressor -> look-ahead limiter.
 
-    THRESHOLD_DB = -30.0
+    Leveler and compressor follow ismailkose/x20-speaker-dsp (MIT): a slow
+    loudness leveler (-20 LUFS target, +-12 dB, 10 s up / 8 s down, holds
+    below -50 LUFS) and a fast stereo-linked RMS compressor (-14 dB, 3:1,
+    6 dB soft knee, 3 ms attack, 120 ms release). The limiter looks one
+    block (2.9 ms) ahead, so peaks are met by a gain already ramped down.
+    """
+
+    TARGET_LUFS = -20.0
+    RANGE_DB = 12.0
+    SILENCE_LUFS = -50.0
+    THRESHOLD_DB = -14.0
     RATIO = 3.0
-    MAKEUP_DB = 5.5  # keeps "movie" loudness-matched to the original for a fair A/B
+    KNEE_DB = 6.0
     CEILING = 0.89
 
     def __init__(self):
-        self.level_db = -90.0
-        self.gain = 1.0
-        self.attack = np.exp(-HOP / (RATE * 0.010))
-        self.release = np.exp(-HOP / (RATE * 0.300))
+        # Rough K-weighting: high-pass at 100 Hz plus a +4 dB shelf above 2 kHz.
+        self.k_high = Filter(*dsp.butter(2, 100 / (RATE / 2), "high"), 2)
+        self.k_shelf = Filter(*dsp.butter(1, 2000 / (RATE / 2), "high"), 2)
+        self.mean_square = 10 ** (self.TARGET_LUFS / 10)
+        self.momentary = np.exp(-HOP / (RATE * 0.4))
+        self.grow = np.exp(-HOP / (RATE * 10.0))
+        self.fall = np.exp(-HOP / (RATE * 8.0))
+        self.relax = np.exp(-HOP / (RATE * 0.5))
+        self.level_gain_db = 0.0
+        self.envelope_db = -90.0
+        self.attack = np.exp(-HOP / (RATE * 0.003))
+        self.release = np.exp(-HOP / (RATE * 0.120))
+        self.lookahead = Delay(2, HOP)
+        self.pending = 1.0    # dynamics gain computed for the block in the delay line
+        self.gain = 1.0       # gain applied at the end of the last output block
 
-    def process(self, block, compress):
-        target = 1.0
+    def _leveler(self, block, enabled):
+        if not enabled:
+            self.level_gain_db *= self.relax
+            return
+        weighted = self.k_high.process(block)
+        weighted = weighted + 0.585 * self.k_shelf.process(weighted)  # ~+4 dB highs
+        self.mean_square = self.momentary * self.mean_square + (1 - self.momentary) * np.mean(weighted ** 2)
+        loudness = -0.691 + 10 * np.log10(self.mean_square + 1e-12)
+        if loudness <= self.SILENCE_LUFS:
+            return  # hold: never pump up silence or room tone
+        wanted = np.clip(self.TARGET_LUFS - loudness, -self.RANGE_DB, self.RANGE_DB)
+        coefficient = self.grow if wanted > self.level_gain_db else self.fall
+        self.level_gain_db = coefficient * self.level_gain_db + (1 - coefficient) * wanted
+
+    def _compressor(self, block, gain_db):
+        level = 10 * np.log10(np.mean(block ** 2) + 1e-12) + gain_db
+        coefficient = self.attack if level > self.envelope_db else self.release
+        self.envelope_db = coefficient * self.envelope_db + (1 - coefficient) * level
+        over = self.envelope_db - self.THRESHOLD_DB
+        half = self.KNEE_DB / 2
+        slope = 1 - 1 / self.RATIO
+        if over <= -half:
+            return 0.0
+        if over < half:
+            return slope * (over + half) ** 2 / (2 * self.KNEE_DB)
+        return slope * over
+
+    def process(self, block, leveler=False, compress=False):
+        self._leveler(block, leveler)
+        gain_db = self.level_gain_db
         if compress:
-            level = 10 * np.log10(np.mean(block ** 2) + 1e-12)
-            coefficient = self.attack if level > self.level_db else self.release
-            self.level_db = coefficient * self.level_db + (1 - coefficient) * level
-            over = max(0.0, self.level_db - self.THRESHOLD_DB)
-            target = 10 ** ((self.MAKEUP_DB - over * (1 - 1 / self.RATIO)) / 20)
-        peak = float(np.max(np.abs(block))) * target
-        if peak > self.CEILING:
-            target *= self.CEILING / peak
-        if target < self.gain:
-            ramp = np.full(HOP, target, dtype=np.float32)  # limiter: act at once
-        else:
-            target = self.gain + (target - self.gain) * 0.05  # smooth recovery
-            ramp = np.linspace(self.gain, target, HOP, dtype=np.float32)
-        self.gain = target
-        out = block * ramp
+            gain_db -= self._compressor(block, gain_db)
+        incoming = 10 ** (gain_db / 20)
+        delayed = self.lookahead.process(block)
+        # Gain for the delayed block: its own dynamics gain, safe for its own
+        # peak, and already safe for the next block's peak by the block's end.
+        own_peak = float(np.max(np.abs(delayed))) + 1e-12
+        next_peak = float(np.max(np.abs(block))) + 1e-12
+        end = min(self.pending, self.CEILING / own_peak, self.CEILING / next_peak)
+        if end > self.gain:
+            end = self.gain + (end - self.gain) * 0.05  # ~200 ms recovery
+        ramp = np.linspace(self.gain, end, HOP, dtype=np.float32)
+        self.gain = end
+        self.pending = incoming
+        out = delayed * ramp
         # Last-resort soft clip, only touches what the limiter could not catch.
         magnitude = np.abs(out)
         knee = 0.95
@@ -224,6 +277,38 @@ class Dynamics:
             np.sign(out) * (knee + 0.05 * np.tanh((magnitude - knee) / 0.05)),
             out,
         ).astype(np.float32)
+
+
+class CrosstalkWidener:
+    """Speaker crosstalk-cancelling widener, after ismailkose/x20-speaker-dsp.
+
+    Only the side signal (L-R)/2, band-limited to 250 Hz - 6 kHz, is fed
+    back with one and two 75 us delays (gains 0.55 and 0.55^2): the first
+    two terms of the recursive canceller for speakers ~10 degrees apart.
+    The centre (dialogue) is untouched.
+    """
+
+    DELAY = 75e-6
+    GAIN = 0.55
+
+    def __init__(self):
+        high_b, high_a = dsp.butter(2, 250 / (RATE / 2), "high")
+        low_b, low_a = dsp.butter(2, 6000 / (RATE / 2))
+        b, a = np.polymul(high_b, low_b), np.polymul(high_a, low_a)
+        # Fractional delays as linear-interpolation taps, combined into one FIR.
+        taps = np.zeros(16)
+        for order, weight in ((1, self.GAIN), (2, self.GAIN ** 2)):
+            position = order * self.DELAY * RATE
+            whole = int(position)
+            fraction = position - whole
+            taps[whole] += weight * (1 - fraction)
+            taps[whole + 1] += weight * fraction
+        self.filter = Filter(np.convolve(b, taps), a, 1)
+
+    def process(self, stereo):
+        side = 0.5 * (stereo[0] - stereo[1])
+        extra = self.filter.process(side[None])[0]
+        return np.stack((stereo[0] + extra, stereo[1] - extra)).astype(np.float32)
 
 
 class Renderer:
@@ -254,7 +339,7 @@ class Renderer:
         self.correction = None             # Convolver with the speaker FIR, or None
         self.correction_path = None
         self.correction_enabled = False
-        self.speaker_side = Filter(*dsp.butter(2, (200 / (RATE / 2), 7000 / (RATE / 2)), "bandpass"), 1)
+        self.widener = CrosstalkWidener()
         self.speaker_delay = Delay(1, int(0.012 * RATE))
         self.speaker_lfe = Filter(*dsp.butter(2, 120 / (RATE / 2)), 1)
         self.glasses_bass = Filter(*dsp.butter(2, 220 / (RATE / 2)), 2)
@@ -396,22 +481,20 @@ class Renderer:
     def _render_speakers(self, feeds, lfe):
         """Pseudo-surround for two open speakers.
 
-        Centre (voice) is mono in both; the front image is widened a little;
-        surrounds are pushed beyond the speakers: their difference signal is
-        boosted in the band where the ears judge width (200 Hz - 7 kHz) and
+        Centre (voice) is mono in both; surrounds get extra side signal and
         their common part arrives 12 ms late so it does not fuse with the
-        front. A small room and the speaker correction finish the chain.
+        front; a crosstalk-cancelling widener then pushes the side content
+        beyond the chassis. A small room and the speaker correction finish.
         """
         fl, fr, centre, rl, rr, sl, sr = feeds
         voice = 0.707 * centre
-        front_mid, front_side = 0.5 * (fl + fr), 0.5 * (fl - fr)
         surround_left, surround_right = sl + 0.8 * rl, sr + 0.8 * rr
         surround_mid = 0.5 * (surround_left + surround_right)
-        surround_side = self.speaker_side.process((0.5 * (surround_left - surround_right))[None])[0] * 2.2
+        surround_side = 0.75 * (surround_left - surround_right)  # surrounds sit wider than the front
         late = self.speaker_delay.process(surround_mid[None])[0] * 0.6
-        left = front_mid + 1.25 * front_side + voice + late + surround_side
-        right = front_mid - 1.25 * front_side + voice + late - surround_side
-        out = np.stack((left, right)).astype(np.float32)
+        left = fl + voice + late + surround_side
+        right = fr + voice + late - surround_side
+        out = self.widener.process(np.stack((left, right)).astype(np.float32))
         out += self.room.process(out * 0.5) * (self.settings["room"] * 0.5)
         if lfe is not None:
             out += self.speaker_lfe.process(lfe[None])[0] * 0.7
@@ -442,6 +525,7 @@ class Renderer:
         self.tick += 1
         self.source = self._detect(block)
         if self.bypass:
+            # A/B compares the spatial part only: same dynamics on both sides.
             out = self._downmix(block)
         else:
             if self.source == "surround":
@@ -453,6 +537,7 @@ class Renderer:
             else:
                 trim = SURROUND_TRIM if self.source == "surround" else STEREO_TRIM
             out = self._render_device(feeds, lfe) * trim
-        # Small open speakers always benefit from tamed peaks.
-        compress = self.settings["compress"] or self.device != "headphones"
-        return self.dynamics.process(out, compress and not self.bypass)
+        # Films everywhere, and small open speakers always, get the leveler
+        # and compressor; games on headphones keep their full dynamics.
+        dynamic = self.settings["compress"] or self.device != "headphones"
+        return self.dynamics.process(out, leveler=dynamic, compress=dynamic)
