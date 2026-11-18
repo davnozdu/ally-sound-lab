@@ -1,0 +1,10 @@
+{
+  "name": "Ally Sound Lab",
+  "author": "davnozdu",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["audio", "pipewire", "headphones"],
+    "description": "Real-time HRTF and StemgenRT headphone processing for ROG Xbox Ally X."
+  }
+}
