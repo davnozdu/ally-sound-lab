@@ -13,7 +13,7 @@ from time import monotonic, perf_counter
 import numpy as np
 import onnxruntime as ort
 
-from spatial import CHANNELS, HOP, PROFILES, RATE, Renderer
+from spatial import CHANNELS, DEVICES, HOP, PROFILES, RATE, Renderer
 
 SINK = "ally_sound_lab"
 RUNTIME_DIR = Path.home() / ".local" / "share" / "ally-sound-npu"
@@ -124,9 +124,49 @@ def stop_process(child):
             child.wait()
 
 
+ALLY_SPEAKER_FIR = Path("/usr/share/cachyos-handheld/rog-ally/game.wav")
+
+
+def is_virtual(item):
+    """Filter-chain or null sinks. Their output follows the default sink, which
+    is ours while live, so routing to one would feed our own input."""
+    properties = item.get("properties", {})
+    return properties.get("node.virtual") == "true" or properties.get("factory.name") == "support.null-audio-sink"
+
+
+def ally_model():
+    try:
+        return Path("/sys/devices/virtual/dmi/id/product_name").read_text().strip()
+    except OSError:
+        return ""
+
+
+def device_kind(item):
+    """Best guess of what a sink is: (kind, speaker correction FIR or None)."""
+    properties = item.get("properties", {})
+    text = " ".join((item.get("name", ""), item.get("description", ""),
+                     properties.get("device.description", ""), properties.get("device.product.name", ""))).lower()
+    port = (item.get("active_port") or "").lower()
+    form = properties.get("device.form_factor", "").lower()
+    if "xreal" in text or "nreal" in text:
+        return "glasses", None
+    if "speaker" in port:
+        internal = item.get("name", "").startswith("alsa_output.pci") and "ally" in ally_model().lower()
+        return "speakers", str(ALLY_SPEAKER_FIR) if internal and ALLY_SPEAKER_FIR.is_file() else None
+    if "headphone" in port or "headset" in port:
+        return "headphones", None
+    if form in ("speaker", "computer", "hifi", "tv", "car", "portable"):
+        return "speakers", None
+    if form in ("headphone", "headset", "handset", "hands-free", "earbuds"):
+        return "headphones", None
+    if "hdmi" in text or "displayport" in text:
+        return "speakers", None  # TV or monitor
+    return "headphones", None
+
+
 def best_sink(available):
     """Highest-priority real output, the same pick WirePlumber would make."""
-    candidates = [item for name, item in available.items() if name != SINK]
+    candidates = [item for name, item in available.items() if name != SINK and not is_virtual(item)]
     if not candidates:
         return None
     return max(
@@ -236,6 +276,10 @@ def read_commands(pending):
         for flag in ("bypass", "neural"):
             if isinstance(command.get(flag), bool):
                 pending[flag] = command[flag]
+        if isinstance(command.get("devices"), dict):
+            pending["overrides"] = {
+                str(name): kind for name, kind in command["devices"].items() if kind in DEVICES
+            }
 
 
 def process_live(profile, neural):
@@ -279,7 +323,18 @@ def process_live(profile, neural):
         pipes["playback"] = open_playback(target)
         pipes["record"] = open_record()
         capture_streams(target, pipes["playback"].pid)
-        emit(phase="live", output=sinks().get(target, {}).get("description", target))
+        apply_device(sinks().get(target, {}))
+
+    def apply_device(item):
+        auto, correction = device_kind(item)
+        kind = overrides.get(target, auto)
+        renderer.set_device(kind, correction if kind == "speakers" else None)
+        device_state["current"] = (auto, correction)
+        emit(phase="live", output=item.get("description", target), sink=target,
+             device=kind, device_auto=auto, correction=bool(renderer.correction_enabled))
+
+    overrides = {}
+    device_state = {"current": None}
 
     def check_route():
         # Follow output changes like the stock audio stack would: a sink the
@@ -306,7 +361,9 @@ def process_live(profile, neural):
             added = {name: item for name, item in available.items() if name not in known}
             known = set(available)
             desired = None
-            if default != SINK and default in available:
+            if target in available and device_kind(available[target]) != device_state["current"]:
+                pending["redetect"] = True  # e.g. a 3.5 mm jack was plugged in
+            if default != SINK and default in available and not is_virtual(available[default]):
                 desired = default
             elif added and best_sink(added):
                 desired = best_sink(added)
@@ -348,6 +405,12 @@ def process_live(profile, neural):
                     renderer.bypass = pending.pop("bypass")
                 if "neural" in pending:
                     renderer.neural = pending.pop("neural")
+                if "overrides" in pending:
+                    overrides.clear()
+                    overrides.update(pending.pop("overrides"))
+                    pending["redetect"] = True
+                if pending.pop("redetect", False):
+                    apply_device(sinks().get(target, {}))
                 health_check = 0
             tick = perf_counter()
             block = np.frombuffer(chunk, dtype="<f4").reshape(HOP, len(CHANNELS)).T

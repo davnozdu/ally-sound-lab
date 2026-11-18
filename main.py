@@ -14,6 +14,7 @@ MODELS = ("vocals.onnx", "ku100.sofa")
 SETTINGS = DATA_DIR / "settings.json"
 WORKER_LOG = DATA_DIR / "worker.log"
 PROFILES = {"game", "movie"}
+DEVICES = {"headphones", "speakers", "glasses"}
 LIVE_MODES = {"off"} | PROFILES
 DEFAULT = {"mode": "off", "neural": True}
 RESTART_LIMIT = 5        # unexpected live-worker exits tolerated...
@@ -65,7 +66,10 @@ class Plugin:
         for appid, entry in (raw.get("apps") or {}).items():
             if str(appid).isdigit() and isinstance(entry, dict):
                 apps[str(appid)] = {**clean_entry(entry, default), "name": str(entry.get("name", ""))[:120]}
-        return {"default": default, "apps": apps}
+        devices = {
+            str(name)[:200]: kind for name, kind in (raw.get("devices") or {}).items() if kind in DEVICES
+        }
+        return {"default": default, "apps": apps, "devices": devices}
 
     def _save_settings(self):
         try:
@@ -108,6 +112,7 @@ class Plugin:
             "app": self.app,
             "custom": self._app_entry() is not None,
             "default": self.settings["default"],
+            "devices": self.settings["devices"],
             "live": self.live_status,
         }
 
@@ -183,6 +188,7 @@ class Plugin:
         self.live = await self._spawn(*args)
         self.live_mode = mode
         self.live_neural = neural
+        await self._command(devices=self.settings["devices"])
         if self.bypass:
             await self._command(bypass=True)
         self._watch(self._watch_live(self.live))
@@ -296,6 +302,22 @@ class Plugin:
             if self.settings["apps"].pop(str(self.app["id"]), None) is not None:
                 self._save_settings()
             await self._apply()
+        return await self.get_status()
+
+    async def set_device_kind(self, kind):
+        """Override the output type of the current device; "auto" forgets it."""
+        if kind != "auto" and kind not in DEVICES:
+            raise ValueError("Неизвестный тип выхода.")
+        async with self.lock:
+            sink = self.live_status.get("sink")
+            if not sink:
+                raise RuntimeError("Обработка не запущена: тип выхода не к чему применить.")
+            if kind == "auto":
+                self.settings["devices"].pop(sink, None)
+            else:
+                self.settings["devices"][sink] = kind
+            self._save_settings()
+            await self._command(devices=self.settings["devices"])
         return await self.get_status()
 
     async def set_bypass(self, enabled):

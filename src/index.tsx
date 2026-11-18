@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { FaHeadphones } from "react-icons/fa";
 
 type Mode = "off" | "game" | "movie";
+type Device = "headphones" | "speakers" | "glasses";
 
 interface Status {
   installed: boolean;
@@ -14,6 +15,7 @@ interface Status {
   app: { id: number; name: string };
   custom: boolean;
   default: { mode: Mode; neural: boolean };
+  devices: Record<string, Device>;
   live: {
     phase?: string;
     output?: string;
@@ -21,6 +23,10 @@ interface Status {
     avg_ms?: number;
     slow_blocks?: number;
     source?: "stereo" | "surround";
+    sink?: string;
+    device?: Device;
+    device_auto?: Device;
+    correction?: boolean;
   };
 }
 
@@ -29,6 +35,14 @@ const setLive = callable<[Mode], Status>("set_live");
 const setBypass = callable<[boolean], Status>("set_bypass");
 const setNeural = callable<[boolean], Status>("set_neural");
 const resetApp = callable<[], Status>("reset_app");
+const setDeviceKind = callable<[Device | "auto"], Status>("set_device_kind");
+
+const deviceLabels: Record<Device, string> = { headphones: "Наушники", speakers: "Динамики", glasses: "Очки (XREAL)" };
+const deviceHints: Record<Device, string> = {
+  headphones: "Полный 3D через HRTF: звук вокруг головы.",
+  speakers: "Голос в центре, сцена шире корпуса, мягкая компрессия.",
+  glasses: "3D для открытых динамиков у ушей и подъём басов.",
+};
 const appChanged = callable<[number, string], Status>("app_changed");
 
 // Follow the foreground app for the whole Steam session, not only while the
@@ -121,7 +135,7 @@ function Content() {
   const load = live?.avg_ms !== undefined ? Math.round((live.avg_ms / BUDGET_MS) * 100) : undefined;
 
   return (
-    <PanelSection title="Объёмный звук в наушниках">
+    <PanelSection title="Объёмный звук">
       <PanelSectionRow>
         <div style={{ opacity: 0.85, fontSize: "0.9em" }}>
           {inApp ? (
@@ -161,6 +175,26 @@ function Content() {
           />
         </PanelSectionRow>
       )}
+      {selected !== "off" && running && live?.sink && (
+        <PanelSectionRow>
+          <DropdownItem
+            label={`Тип выхода: ${live.output ?? ""}`}
+            description={
+              (live.device ? deviceHints[live.device] : "") +
+              (live.correction ? " Коррекция динамиков Ally включена." : "")
+            }
+            disabled={busy}
+            selectedOption={status?.devices[live.sink] ?? "auto"}
+            rgOptions={[
+              { data: "auto", label: `Авто (${live.device_auto ? deviceLabels[live.device_auto] : "—"})` },
+              { data: "headphones", label: deviceLabels.headphones },
+              { data: "speakers", label: deviceLabels.speakers },
+              { data: "glasses", label: deviceLabels.glasses },
+            ]}
+            onChange={(option) => void run(() => setDeviceKind(option.data as Device | "auto"))}
+          />
+        </PanelSectionRow>
+      )}
       {selected !== "off" && (
         <PanelSectionRow>
           <ToggleField
@@ -179,7 +213,10 @@ function Content() {
               "Подключаю обработку…"
             ) : (
               <>
-                <div>Выход: {live?.output}</div>
+                <div>
+                  Выход: {live?.output}
+                  {live?.device ? ` · ${deviceLabels[live.device]}` : ""}
+                </div>
                 {live?.source && <div>{sources[live.source]}</div>}
                 {load !== undefined && (
                   <div>

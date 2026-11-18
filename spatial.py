@@ -43,6 +43,15 @@ SURROUND_TRIM = 10 ** (-3.7 / 20)
 # Stereo is matched to the untouched input (bypass passes it through as is);
 # the render was measured 4.4 dB below that.
 STEREO_TRIM = 10 ** (4.4 / 20)
+# Output devices. Headphones get full binaural HRTF. Open speakers mix both
+# channels in the air, so binaural cues are lost: "speakers" uses a widening
+# virtualiser instead. Glasses (XREAL) have open speakers right at the ears,
+# close enough for HRTF cues to survive, but light on bass.
+DEVICES = ("headphones", "speakers", "glasses")
+# Loudness trims for the speaker virtualiser per source, calibrated against
+# bypass with tools/offline_render.py (replace the binaural trims).
+SPEAKER_TRIM = {"stereo": 10 ** (0.5 / 20), "surround": 10 ** (-1.5 / 20)}
+GLASSES_BASS_DB = 4.0
 
 
 def load_hrirs(path):
@@ -94,8 +103,10 @@ def room_response(rt60, seed):
 class Convolver:
     """Uniformly partitioned overlap-save convolution, S inputs to 2 ears."""
 
-    def __init__(self, responses):
+    def __init__(self, responses, diagonal=False):
+        # diagonal: responses are (S, 1, L) and input s only feeds output s.
         sources, ears, length = responses.shape
+        self.diagonal = diagonal
         self.parts = -(-length // HOP)
         self.spectra = self._spectra(responses)
         self.history = np.zeros((self.parts, sources, HOP + 1), dtype=np.complex64)
@@ -116,9 +127,51 @@ class Convolver:
         self.previous = block
         self.history[1:] = self.history[:-1]
         self.history[0] = np.fft.rfft(frame, axis=-1)
-        # Plain multiply-and-sum is ~5x faster than einsum for these shapes.
-        spectrum = (self.history[:, :, None, :] * self.spectra).sum(axis=(0, 1))
+        if self.diagonal:
+            spectrum = (self.history * self.spectra[:, :, 0, :]).sum(axis=0)
+        else:
+            # Plain multiply-and-sum is ~5x faster than einsum for these shapes.
+            spectrum = (self.history[:, :, None, :] * self.spectra).sum(axis=(0, 1))
         return np.fft.irfft(spectrum, n=2 * HOP, axis=-1)[:, HOP:].astype(np.float32)
+
+
+def load_speaker_correction(path, max_taps=16384):
+    """Stereo FIR speaker correction (e.g. CachyOS' ROG Ally game.wav) as (2, 1, L).
+
+    Resampled to RATE, cut where 99.9% of the energy is reached, faded out,
+    and normalised to unity gain at 1 kHz so loudness calibration still holds.
+    """
+    from scipy.io import wavfile
+
+    rate, data = wavfile.read(path)
+    data = np.asarray(data, dtype=np.float64)
+    if data.ndim == 1:
+        data = np.stack((data, data), axis=1)
+    data = data[:, :2].T
+    if rate != RATE:
+        data = dsp.resample_poly(data, RATE, rate, axis=-1)
+    energy = np.cumsum(np.sum(data ** 2, axis=0))
+    length = int(min(max_taps, np.searchsorted(energy, 0.999 * energy[-1]) + 1))
+    length = max(length, 256)
+    data = data[:, :length].copy()
+    fade = min(256, length // 4)
+    data[:, -fade:] *= np.linspace(1, 0, fade)
+    spectrum = np.abs(np.fft.rfft(data, n=8192, axis=-1))
+    bin_1k = int(round(1000 * 8192 / RATE))
+    data /= spectrum[:, bin_1k:bin_1k + 1]
+    return data[:, None, :].astype(np.float32)
+
+
+class Filter:
+    """Stateful IIR filter over a (channels, HOP) block."""
+
+    def __init__(self, b, a, channels):
+        self.b, self.a = b, a
+        self.state = np.zeros((channels, max(len(a), len(b)) - 1))
+
+    def process(self, block):
+        out, self.state = dsp.lfilter(self.b, self.a, block, axis=-1, zi=self.state)
+        return out.astype(np.float32)
 
 
 class Delay:
@@ -196,7 +249,28 @@ class Renderer:
         self.bypass = False
         self.source = "stereo"
         self.neural = neural  # StemgenRT for stereo; otherwise a passive matrix
+        # Speaker virtualiser state.
+        self.device = "headphones"
+        self.correction = None             # Convolver with the speaker FIR, or None
+        self.correction_path = None
+        self.correction_enabled = False
+        self.speaker_side = Filter(*dsp.butter(2, (200 / (RATE / 2), 7000 / (RATE / 2)), "bandpass"), 1)
+        self.speaker_delay = Delay(1, int(0.012 * RATE))
+        self.speaker_lfe = Filter(*dsp.butter(2, 120 / (RATE / 2)), 1)
+        self.glasses_bass = Filter(*dsp.butter(2, 220 / (RATE / 2)), 2)
         self.set_profile(profile)
+
+    def set_device(self, kind, correction_path=None):
+        """kind: headphones | speakers | glasses. correction_path: speaker FIR."""
+        if kind not in DEVICES:
+            raise ValueError(kind)
+        self.device = kind
+        self.correction_enabled = False
+        if kind == "speakers" and correction_path:
+            if self.correction is None or self.correction_path != correction_path:
+                self.correction = Convolver(load_speaker_correction(correction_path), diagonal=True)
+                self.correction_path = correction_path
+            self.correction_enabled = True
 
     def set_profile(self, profile):
         if profile not in PROFILES:
@@ -319,6 +393,41 @@ class Renderer:
             ears += (low * 1.4).astype(np.float32)
         return ears * 0.85
 
+    def _render_speakers(self, feeds, lfe):
+        """Pseudo-surround for two open speakers.
+
+        Centre (voice) is mono in both; the front image is widened a little;
+        surrounds are pushed beyond the speakers: their difference signal is
+        boosted in the band where the ears judge width (200 Hz - 7 kHz) and
+        their common part arrives 12 ms late so it does not fuse with the
+        front. A small room and the speaker correction finish the chain.
+        """
+        fl, fr, centre, rl, rr, sl, sr = feeds
+        voice = 0.707 * centre
+        front_mid, front_side = 0.5 * (fl + fr), 0.5 * (fl - fr)
+        surround_left, surround_right = sl + 0.8 * rl, sr + 0.8 * rr
+        surround_mid = 0.5 * (surround_left + surround_right)
+        surround_side = self.speaker_side.process((0.5 * (surround_left - surround_right))[None])[0] * 2.2
+        late = self.speaker_delay.process(surround_mid[None])[0] * 0.6
+        left = front_mid + 1.25 * front_side + voice + late + surround_side
+        right = front_mid - 1.25 * front_side + voice + late - surround_side
+        out = np.stack((left, right)).astype(np.float32)
+        out += self.room.process(out * 0.5) * (self.settings["room"] * 0.5)
+        if lfe is not None:
+            out += self.speaker_lfe.process(lfe[None])[0] * 0.7
+        if self.correction_enabled:
+            out = self.correction.process(out)
+        return out
+
+    def _render_device(self, feeds, lfe):
+        if self.device == "speakers":
+            return self._render_speakers(feeds, lfe)
+        ears = self._render(feeds, lfe)
+        if self.device == "glasses":
+            # Low shelf: add the low band back on top, open speakers lack bass.
+            ears = ears + self.glasses_bass.process(ears) * (10 ** (GLASSES_BASS_DB / 20) - 1)
+        return ears
+
     def _downmix(self, block):
         """What you would hear without us: stereo untouched, 5.1/7.1 folded down."""
         if self.source == "stereo":
@@ -337,8 +446,13 @@ class Renderer:
         else:
             if self.source == "surround":
                 feeds, lfe = self._surround_feeds(block)
-                out = self._render(feeds, lfe) * SURROUND_TRIM
             else:
                 feeds, lfe = self._stereo_feeds(block)
-                out = self._render(feeds, lfe) * STEREO_TRIM
-        return self.dynamics.process(out, self.settings["compress"] and not self.bypass)
+            if self.device == "speakers":
+                trim = SPEAKER_TRIM[self.source]
+            else:
+                trim = SURROUND_TRIM if self.source == "surround" else STEREO_TRIM
+            out = self._render_device(feeds, lfe) * trim
+        # Small open speakers always benefit from tamed peaks.
+        compress = self.settings["compress"] or self.device != "headphones"
+        return self.dynamics.process(out, compress and not self.bypass)

@@ -18,7 +18,7 @@ from scipy.io import wavfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from audio_worker import MODELS, Vocals  # noqa: E402
-from spatial import HOP, PROFILES, RATE, Renderer  # noqa: E402
+from spatial import DEVICES, HOP, PROFILES, RATE, Renderer  # noqa: E402
 
 
 def decode(path, seconds):
@@ -48,11 +48,14 @@ def main():
     parser.add_argument("--bypass", action="store_true")
     parser.add_argument("--seconds", type=float, default=30)
     parser.add_argument("--no-model", action="store_true")
+    parser.add_argument("--device", choices=DEVICES, default="headphones")
+    parser.add_argument("--correction", type=Path, help="speaker FIR wav (speakers only)")
     args = parser.parse_args()
 
     audio, channels = decode(args.source, args.seconds)
     renderer = Renderer(MODELS / "ku100.sofa", make_vocals=Vocals, profile=args.profile, neural=not args.no_model)
     renderer.bypass = args.bypass
+    renderer.set_device(args.device, args.correction)
     blocks = audio.shape[1] // HOP
     out = np.zeros((2, blocks * HOP), dtype=np.float32)
     times = []
@@ -70,7 +73,7 @@ def main():
     rms_db = 20 * np.log10(np.sqrt(np.mean(out ** 2)) + 1e-12)
     print(
         f"{args.source.name}: {channels}ch -> {args.output.name} profile={args.profile} "
-        f"bypass={args.bypass} source={sources}\n"
+        f"bypass={args.bypass} device={args.device} source={sources}\n"
         f"  block avg {times.mean():.3f} ms, p99 {np.percentile(times, 99):.3f} ms, "
         f"max {times.max():.2f} ms, budget {budget:.2f} ms, over {int((times > budget).sum())}/{len(times)}\n"
         f"  output RMS {rms_db:.1f} dBFS, peak {np.max(np.abs(out)):.3f}"
