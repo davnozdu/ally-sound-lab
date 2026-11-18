@@ -51,7 +51,7 @@ def main():
     args = parser.parse_args()
 
     audio, channels = decode(args.source, args.seconds)
-    renderer = Renderer(MODELS / "ku100.sofa", vocals=Vocals(), profile=args.profile, neural=not args.no_model)
+    renderer = Renderer(MODELS / "ku100.sofa", make_vocals=Vocals, profile=args.profile, neural=not args.no_model)
     renderer.bypass = args.bypass
     blocks = audio.shape[1] // HOP
     out = np.zeros((2, blocks * HOP), dtype=np.float32)

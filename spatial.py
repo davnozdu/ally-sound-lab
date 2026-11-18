@@ -26,14 +26,23 @@ SPEAKERS = ((FL, 30), (FR, 330), (FC, 0), (RL, 145), (RR, 215), (SL, 100), (SR, 
 
 PROFILES = {
     # Precise localisation: small dry room, untouched dynamics.
-    "game": {"dialogue": 1.0, "room": 0.10, "rt60": 0.22, "compress": False},
-    # Clear dialogue over effects, bigger room, tamed loud scenes.
-    "movie": {"dialogue": 10 ** (5 / 20), "room": 0.16, "rt60": 0.40, "compress": True},
+    # Voices in 5.1/7.1 stay where the game put them (an enemy behind you).
+    "game": {"dialogue": 1.0, "room": 0.10, "rt60": 0.22, "compress": False, "dub_fix": False},
+    # Clear dialogue over effects, bigger room, tamed loud scenes. In 5.1/7.1
+    # the network gathers voice from every channel into the centre, which
+    # repairs dubs that were smeared over all speakers.
+    "movie": {"dialogue": 10 ** (5 / 20), "room": 0.16, "rt60": 0.40, "compress": True, "dub_fix": True},
 }
 ROOM_SECONDS = 0.45
 SILENCE = 1e-5          # RMS below this counts as an unused channel (-100 dBFS)
 SURROUND_HOLD = 1.0     # seconds a surround channel stays "seen" after going quiet
 AMBIENCE_DELAY = 0.015  # rear ambience delay, decorrelates it from the front
+# Five full-range speakers sum louder than the stereo fold-down; this trim
+# keeps 5.1/7.1 loudness-matched to the A/B bypass (measured on Ally).
+SURROUND_TRIM = 10 ** (-3.7 / 20)
+# Stereo is matched to the untouched input (bypass passes it through as is);
+# the render was measured 4.4 dB below that.
+STEREO_TRIM = 10 ** (4.4 / 20)
 
 
 def load_hrirs(path):
@@ -127,7 +136,7 @@ class Dynamics:
 
     THRESHOLD_DB = -30.0
     RATIO = 3.0
-    MAKEUP_DB = 3.0  # keeps "movie" loudness-matched to bypass for a fair A/B
+    MAKEUP_DB = 5.5  # keeps "movie" loudness-matched to the original for a fair A/B
     CEILING = 0.89
 
     def __init__(self):
@@ -165,12 +174,19 @@ class Dynamics:
 
 
 class Renderer:
-    def __init__(self, hrir_path, vocals=None, profile="game", neural=True):
+    def __init__(self, hrir_path, make_vocals=None, profile="game", neural=True):
         hrirs, self.positions = load_hrirs(hrir_path)
         self.direct = Convolver(hrirs)
         self.rooms = {name: room_response(values["rt60"], seed=7) for name, values in PROFILES.items()}
         self.room = Convolver(self.rooms[profile])
-        self.vocals = vocals
+        self.model = make_vocals() if make_vocals else None
+        latency = getattr(self.model, "latency", 1)
+        self.model_delay = Delay(8, latency * HOP)  # channels kept in step with the model
+        self.model_delay_stereo = Delay(2, latency * HOP)  # stands in for the model on silence
+        self.voice_power = 0.0               # running statistics for dub-fix
+        self.voice_xcorr = np.zeros(7)
+        self.voice_decay = np.exp(-HOP / (RATE * 0.25))
+        self.tick = 0
         self.ambience_delay = Delay(2, int(AMBIENCE_DELAY * RATE))
         self.dynamics = Dynamics()
         lfe_b, lfe_a = dsp.butter(2, 120 / (RATE / 2))
@@ -179,7 +195,6 @@ class Renderer:
         self.clock = 0.0
         self.bypass = False
         self.source = "stereo"
-        self.model_active = False
         self.neural = neural  # StemgenRT for stereo; otherwise a passive matrix
         self.set_profile(profile)
 
@@ -201,7 +216,23 @@ class Renderer:
 
     # -- speaker feeds ----------------------------------------------------
 
+    def _model(self, audio):
+        """(dry, rest) for a stereo pair, both delayed by the model latency.
+
+        Silence skips inference (saves a core and battery while nothing plays);
+        the pipelined model notices the gap and drops its stale result.
+        """
+        if np.sqrt(np.mean(audio ** 2)) <= SILENCE:
+            dry = self.model_delay_stereo.process(np.asarray(audio, dtype=np.float32))
+            return dry, dry
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+        dry, rest = self.model.process(audio, self.tick)
+        self.model_delay_stereo.process(audio)  # keep the bypass delay line in step
+        return dry, rest
+
     def _surround_feeds(self, block):
+        if self.neural and self.model is not None and self.settings["dub_fix"]:
+            return self._dub_fix_feeds(block)
         feeds = block[[FL, FR, FC, RL, RR, SL, SR]].copy()
         feeds[2] *= self.settings["dialogue"]
         sides = np.sqrt(np.mean(block[[SL, SR]] ** 2))
@@ -210,10 +241,47 @@ class Renderer:
             feeds[5:7], feeds[3:5] = feeds[3:5], 0.0
         return feeds, block[LFE]
 
+    def _dub_fix_feeds(self, block):
+        """5.1/7.1 with voice gathered from every channel into the centre.
+
+        A careless dub copies the same voice track into several channels. One
+        StemgenRT pass over a fold-down of all channels gives a reference voice
+        v (2 x HOP); each channel's share of it is tracked with a running
+        least-squares fit (~0.25 s memory), subtracted there, and the voice is
+        re-placed in the centre alone. One model pass instead of one per pair.
+        """
+        fold = np.stack((
+            block[FL] + 0.707 * block[FC] + 0.5 * (block[SL] + block[RL]),
+            block[FR] + 0.707 * block[FC] + 0.5 * (block[SR] + block[RR]),
+        ))
+        dry, rest = self._model(fold)
+        # Dub voice is effectively mono: one reference keeps the fit well posed.
+        voice = (dry - rest).mean(axis=0).astype(np.float64)
+        late = self.model_delay.process(block)  # aligned with the model output
+        channels = late[[FL, FR, FC, RL, RR, SL, SR]].astype(np.float64)
+        decay = self.voice_decay
+        self.voice_power = decay * self.voice_power + voice @ voice
+        self.voice_xcorr = decay * self.voice_xcorr + channels @ voice
+        # Never an inverted voice; the small floor avoids dividing by silence.
+        # The network's voice is slightly coloured, so a full-strength fit
+        # over-subtracts (measured -0.13); 0.85 leaves a trace instead of an
+        # inverted, phasey echo.
+        weights = 0.85 * np.maximum(self.voice_xcorr, 0.0) / (self.voice_power + 1e-9)
+        parts = np.outer(weights, voice)          # voice found in each channel
+        clean = (channels - parts).astype(np.float32)
+        # A voice shared by a speaker pair is heard as their sum; 0.707 keeps
+        # its loudness about the same once it comes from the centre alone.
+        gathered = 0.707 * (parts[0] + parts[1]) + parts[2] + 0.707 * parts[3:].sum(axis=0)
+        clean[2] += (gathered * self.settings["dialogue"]).astype(np.float32)
+        if np.sqrt(np.mean(late[[SL, SR]] ** 2)) <= SILENCE:
+            # 5.1: its surround pair sits at ~110 degrees, not behind.
+            clean[5:7], clean[3:5] = clean[3:5], 0.0
+        return clean, late[LFE]
+
     def _stereo_feeds(self, block):
         dry = block[[FL, FR]]
-        if self.neural and self.vocals is not None:
-            dry, rest = self.vocals.process(np.ascontiguousarray(dry))
+        if self.neural and self.model is not None:
+            dry, rest = self._model(dry)
             voice = dry - rest
         else:
             # Passive upmix: half of the shared (mid) signal becomes the centre.
@@ -251,9 +319,10 @@ class Renderer:
             ears += (low * 1.4).astype(np.float32)
         return ears * 0.85
 
-    @staticmethod
-    def _downmix(block):
-        """Plain stereo fold-down for A/B comparison (what you'd hear without us)."""
+    def _downmix(self, block):
+        """What you would hear without us: stereo untouched, 5.1/7.1 folded down."""
+        if self.source == "stereo":
+            return block[[FL, FR]].astype(np.float32)
         centre = 0.707 * block[FC]
         left = block[FL] + centre + 0.707 * (block[SL] + block[RL])
         right = block[FR] + centre + 0.707 * (block[SR] + block[RR])
@@ -261,17 +330,15 @@ class Renderer:
 
     def process(self, block):
         """block: float32 (8, HOP). Returns float32 (2, HOP)."""
+        self.tick += 1
         self.source = self._detect(block)
-        uses_model = not self.bypass and self.source == "stereo" and self.neural
-        if uses_model and not self.model_active and hasattr(self.vocals, "reset"):
-            self.vocals.reset()  # resume after a pause: drop the stale block
-        self.model_active = uses_model
         if self.bypass:
             out = self._downmix(block)
         else:
             if self.source == "surround":
                 feeds, lfe = self._surround_feeds(block)
+                out = self._render(feeds, lfe) * SURROUND_TRIM
             else:
                 feeds, lfe = self._stereo_feeds(block)
-            out = self._render(feeds, lfe)
+                out = self._render(feeds, lfe) * STEREO_TRIM
         return self.dynamics.process(out, self.settings["compress"] and not self.bypass)

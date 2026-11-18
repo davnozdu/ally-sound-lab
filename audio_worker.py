@@ -42,6 +42,8 @@ def runtime(name, threads):
 
 
 class Vocals:
+    latency = 1  # hops: the graph returns the previous input hop
+
     def __init__(self):
         self.session = runtime("vocals.onnx", 1)
         self.state = {
@@ -50,7 +52,7 @@ class Vocals:
         }
         self.previous = np.zeros((2, HOP), dtype=np.float32)
 
-    def process(self, audio):
+    def process(self, audio, tick=None):
         vocals, *states = self.session.run(
             None, {"audio_chunk": np.ascontiguousarray(audio[None]), **self.state}
         )
@@ -69,11 +71,14 @@ class PipelinedVocals:
     latency (2.9 ms) and roughly halves the per-block time on the audio thread.
     """
 
+    latency = Vocals.latency + 1
+
     def __init__(self, vocals):
         self.vocals = vocals
         self.inbox = Queue(maxsize=1)
         self.outbox = Queue(maxsize=1)
         self.pending = False
+        self.last_tick = None
         Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -81,13 +86,12 @@ class PipelinedVocals:
             audio = self.inbox.get()
             self.outbox.put(self.vocals.process(audio))
 
-    def reset(self):
-        """Drop a result left over from before a pause in stereo input."""
-        if self.pending:
+    def process(self, audio, tick):
+        if self.pending and self.last_tick != tick - 1:
+            # This group was idle for a while: its queued result is stale.
             self.outbox.get()
             self.pending = False
-
-    def process(self, audio):
+        self.last_tick = tick
         previous = self.outbox.get() if self.pending else None
         self.inbox.put(np.array(audio, dtype=np.float32, copy=True))
         self.pending = True
@@ -131,10 +135,30 @@ def best_sink(available):
     )["name"]
 
 
+FULL_VOLUME = 65536
+
+
+def sink_volume(item):
+    """Raw volume (65536 = 100%) of a sink from `pactl --format=json`, or None."""
+    try:
+        return max(channel["value"] for channel in item["volume"].values())
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def set_volume(sink, raw):
+    pulse("set-sink-volume", sink, str(int(raw)))
+
+
 def recover_route():
     state = json.loads(ROUTE_STATE.read_text()) if ROUTE_STATE.exists() else {}
     target = state.get("target")
     available = sinks()
+    # While live, the volume slider drives our sink and the device sits at
+    # 100%. Hand the device the slider's current volume back.
+    volume = sink_volume(available.get(SINK)) or state.get("volume")
+    if target in available and volume:
+        set_volume(target, volume)
     if pulse("get-default-sink") == SINK:
         fallback = target if target in available else best_sink(available)
         if fallback:
@@ -217,7 +241,7 @@ def read_commands(pending):
 def process_live(profile, neural):
     realtime = realtime_priority()  # threads started below inherit it
     renderer = Renderer(
-        MODELS / "ku100.sofa", vocals=PipelinedVocals(Vocals()), profile=profile, neural=neural,
+        MODELS / "ku100.sofa", make_vocals=lambda: PipelinedVocals(Vocals()), profile=profile, neural=neural,
     )
     pending = {}
     Thread(target=read_commands, args=(pending,), daemon=True).start()
@@ -234,13 +258,24 @@ def process_live(profile, neural):
     retarget = Queue()
     chunk_bytes = HOP * len(CHANNELS) * 4
 
-    def route_to(new_target):
+    def route_to(new_target, initial=False):
         nonlocal target
         # Restart both ends so no stale audio piles up in the capture buffer.
         stop_process(pipes["playback"])
         stop_process(pipes["record"])
+        # The system volume slider follows the default sink, which is ours.
+        # Move the device's own volume onto our sink and run the device at
+        # 100%, so the slider keeps its full range; give it back on leaving.
+        available = sinks()
+        slider = sink_volume(available.get(SINK))
+        if not initial and target in available and slider:
+            set_volume(target, slider)
+        device_volume = sink_volume(available.get(new_target))
+        if device_volume:
+            set_volume(SINK, device_volume)
+            set_volume(new_target, FULL_VOLUME)
         target = new_target
-        ROUTE_STATE.write_text(json.dumps({"target": target}))
+        ROUTE_STATE.write_text(json.dumps({"target": target, "volume": device_volume}))
         pipes["playback"] = open_playback(target)
         pipes["record"] = open_record()
         capture_streams(target, pipes["playback"].pid)
@@ -292,7 +327,7 @@ def process_live(profile, neural):
             "sink_properties=device.description=Ally_Sound_Lab",
         )
         pulse("set-default-sink", SINK)
-        route_to(target)
+        route_to(target, initial=True)
         Thread(target=check_route, daemon=True).start()
         while True:
             if not retarget.empty():
