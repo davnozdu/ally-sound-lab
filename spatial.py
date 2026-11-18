@@ -27,11 +27,17 @@ SPEAKERS = ((FL, 30), (FR, 330), (FC, 0), (RL, 145), (RR, 215), (SL, 100), (SR, 
 PROFILES = {
     # Precise localisation: small dry room, untouched dynamics.
     # Voices in 5.1/7.1 stay where the game put them (an enemy behind you).
-    "game": {"dialogue": 1.0, "room": 0.10, "rt60": 0.22, "compress": False, "dub_fix": False},
+    # The neural stereo upmix costs ~90% of a core, i.e. right at the 2.9 ms
+    # block budget, so in a game it drops blocks and the centre channel pumps --
+    # audible as crackle -- while stealing a core from the game. Games get the
+    # passive matrix; the network stays for films, which are not interactive.
+    "game": {"dialogue": 1.0, "room": 0.10, "rt60": 0.22, "compress": False,
+             "dub_fix": False, "stereo_model": False},
     # Clear dialogue over effects, bigger room, tamed loud scenes. In 5.1/7.1
     # the network gathers voice from every channel into the centre, which
     # repairs dubs that were smeared over all speakers.
-    "movie": {"dialogue": 10 ** (5 / 20), "room": 0.16, "rt60": 0.40, "compress": True, "dub_fix": True},
+    "movie": {"dialogue": 10 ** (5 / 20), "room": 0.16, "rt60": 0.40, "compress": True,
+              "dub_fix": True, "stereo_model": True},
 }
 ROOM_SECONDS = 0.45
 SILENCE = 1e-5          # RMS below this counts as an unused channel (-100 dBFS)
@@ -439,7 +445,7 @@ class Renderer:
 
     def _stereo_feeds(self, block):
         dry = block[[FL, FR]]
-        if self.neural and self.model is not None:
+        if self.neural and self.model is not None and self.settings.get("stereo_model", True):
             dry, rest = self._model(dry)
             voice = dry - rest
         else:

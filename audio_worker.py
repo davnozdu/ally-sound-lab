@@ -3,7 +3,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
-from queue import Empty, Queue
+import select
+from queue import Empty, Full, Queue
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from time import monotonic, perf_counter
 import numpy as np
 import onnxruntime as ort
 
-from spatial import CHANNELS, DEVICES, HOP, PROFILES, RATE, Renderer
+from spatial import CHANNELS, DEVICES, HOP, PROFILES, RATE, Delay, Renderer
 
 SINK = "ally_sound_lab"
 RUNTIME_DIR = Path.home() / ".local" / "share" / "ally-sound-npu"
@@ -67,8 +68,12 @@ class PipelinedVocals:
     """Runs StemgenRT on its own thread, one block behind the audio thread.
 
     ONNX Runtime releases the GIL, so inference of block N overlaps with the
-    spatial rendering of block N-1 on another core. Costs one extra hop of
-    latency (2.9 ms) and roughly halves the per-block time on the audio thread.
+    spatial rendering of block N-1 on another core. Both queues are kept full
+    but never waited on: when inference falls behind (it runs at ~90% of one
+    core, i.e. right at the 2.9 ms block budget) the audio thread carries on
+    with its own delayed dry signal instead of stalling. Blocking here cost
+    dropouts -- audible as crackle -- and every stall pushed the whole stream
+    back in time.
     """
 
     latency = Vocals.latency + 1
@@ -79,6 +84,7 @@ class PipelinedVocals:
         self.outbox = Queue(maxsize=1)
         self.pending = False
         self.last_tick = None
+        self.fallback = Delay(2, self.latency * HOP)  # dry signal kept in step
         Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -89,16 +95,22 @@ class PipelinedVocals:
     def process(self, audio, tick):
         if self.pending and self.last_tick != tick - 1:
             # This group was idle for a while: its queued result is stale.
-            self.outbox.get()
+            try:
+                self.outbox.get_nowait()
+            except Empty:
+                pass
             self.pending = False
         self.last_tick = tick
-        previous = self.outbox.get() if self.pending else None
-        self.inbox.put(np.array(audio, dtype=np.float32, copy=True))
-        self.pending = True
-        if previous is None:
-            silence = np.zeros_like(audio)
-            return silence, silence
-        return previous
+        dry = self.fallback.process(np.asarray(audio, dtype=np.float32))
+        try:
+            self.inbox.put_nowait(np.array(audio, dtype=np.float32, copy=True))
+            self.pending = True
+        except Full:
+            pass                      # model is behind: this block goes without it
+        try:
+            return self.outbox.get_nowait()
+        except Empty:
+            return dry, dry           # no voice reference this block, but no stall
 
 
 def realtime_priority():
@@ -227,15 +239,15 @@ SURROUND_MAP = ",".join(CHANNELS)
 # page fault, a scene hitch at game start) leaves the sound seconds behind the
 # picture for the rest of the session. Cap the buffered audio instead, so a
 # stall costs a short dropout rather than permanent lag.
-RECORD_CAP = 32768   # bytes: 23 ms of 8-channel float32 at 44100
-PLAYBACK_CAP = 16384  # bytes: 46 ms of stereo float32 at 44100
+RECORD_CAP = 49152   # bytes: 35 ms of 8-channel float32 at 44100
+PLAYBACK_CAP = 24576  # bytes: 70 ms of stereo float32 at 44100
 # A single block takes 2.9 ms, so a read that waits this long means the process
-# or the graph stalled and audio queued up somewhere behind us. That backlog is
-# stale by definition: re-open both ends instead of playing it late forever.
-STALL_SECONDS = 0.25
+# or the graph stalled. Only re-open the ends if audio actually queued up behind
+# us (see the backlog check in the loop) -- a quiet menu must not trigger it.
+STALL_SECONDS = 1.0
 COMMON = [
     "--raw", "--format=float32le", f"--rate={RATE}",
-    "--latency-msec=12", "--process-time-msec=2", "--client-name=Ally Sound Lab",
+    "--latency-msec=20", "--process-time-msec=4", "--client-name=Ally Sound Lab",
 ]
 
 
@@ -411,12 +423,13 @@ def process_live(profile, neural):
                     route_to(new_target)
             wait_started = monotonic()
             chunk = pipes["record"].stdout.read(chunk_bytes)
-            if monotonic() - wait_started > STALL_SECONDS and monotonic() - last_resync > 2:
-                # We were starved, so everything that arrived in the meantime is old
-                # news. Drop it and re-sync instead of running seconds behind.
-                last_resync = monotonic()
-                route_to(target)
-                continue
+            if monotonic() - wait_started > STALL_SECONDS and monotonic() - last_resync > 3:
+                if select.select([pipes["record"].stdout.fileno()], [], [], 0)[0]:
+                    # Starved and more audio is already waiting: that backlog is stale,
+                    # so start over instead of replaying it seconds late.
+                    last_resync = monotonic()
+                    route_to(target)
+                    continue
             if disconnect.is_set():
                 raise RuntimeError("PipeWire удалил аудиовыход Ally Sound Lab.")
             if len(chunk) != chunk_bytes:
