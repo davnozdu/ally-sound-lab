@@ -76,15 +76,12 @@
 
 ## Установка
 
-Нужны: Decky Loader, `uv` (`sudo pacman -S uv`), `curl`, `sha256sum`, PipeWire с `pactl`/`parec`/`pacat`. Коррекция динамиков Ally берётся из пакета `cachyos-handheld`, если он установлен.
+Нужны Decky Loader, `curl`, `sha256sum` и PipeWire с `pactl`/`parec`/`pacat` (в CachyOS всё есть). Коррекция динамиков Ally берётся из пакета `cachyos-handheld`, если он установлен.
 
-Без `install-runtime.sh` плагин покажет «Модели не установлены».
+1. Распакуй zip из релиза в `~/homebrew/plugins/` и перезапусти Decky (или установи zip через настройки Decky).
+2. Открой плагин и нажми **«Установить компоненты»**. Плагин сам скачает Python 3.13, библиотеки (numpy, scipy, onnxruntime, h5py) и модели (StemgenRT, HRTF KU100) в `~/.local/share/ally-sound-npu`, с проверкой контрольных сумм. Нужно около 300 МБ и интернет, root не нужен. Занимает около минуты. Если в системе нет `uv`, скачивается закреплённая версия 0.13.6 с проверкой хеша.
 
-На приставке, от обычного пользователя:
-
-```bash
-./install-runtime.sh          # venv (Python 3.13) + модели в ~/.local/share/ally-sound-npu
-```
+То же из терминала: `./install-runtime.sh`.
 
 Сборка фронтенда:
 
@@ -93,7 +90,7 @@ npm ci
 npm run build                 # dist/index.js
 ```
 
-Скопируй `plugin.json`, `package.json`, `main.py`, `audio_worker.py`, `spatial.py` и `dist/index.js` в `~/homebrew/plugins/Ally Sound Lab/`, затем выполни `sudo systemctl restart plugin_loader`.
+Скопируй `plugin.json`, `package.json`, `main.py`, `audio_worker.py`, `spatial.py`, `install-runtime.sh` и `dist/index.js` в `~/homebrew/plugins/Ally Sound Lab/`, затем выполни `sudo systemctl restart plugin_loader`.
 
 Офлайн-прогон файла через ту же цепочку с замером времени на блок:
 

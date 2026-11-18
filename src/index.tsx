@@ -1,5 +1,5 @@
 import { callable, definePlugin } from "@decky/api";
-import { DropdownItem, PanelSection, PanelSectionRow, ToggleField, staticClasses } from "@decky/ui";
+import { ButtonItem, DropdownItem, PanelSection, PanelSectionRow, ToggleField, staticClasses } from "@decky/ui";
 import { useEffect, useState } from "react";
 import { FaHeadphones } from "react-icons/fa";
 
@@ -16,6 +16,7 @@ interface Status {
   custom: boolean;
   default: { mode: Mode; neural: boolean };
   devices: Record<string, Device>;
+  install: { phase?: "running" | "done" | "error"; step?: string; error?: string };
   live: {
     phase?: string;
     output?: string;
@@ -36,6 +37,7 @@ const setBypass = callable<[boolean], Status>("set_bypass");
 const setNeural = callable<[boolean], Status>("set_neural");
 const resetApp = callable<[], Status>("reset_app");
 const setDeviceKind = callable<[Device | "auto"], Status>("set_device_kind");
+const installRuntime = callable<[], Status>("install_runtime");
 
 const deviceLabels: Record<Device, string> = { headphones: "Наушники", speakers: "Динамики", glasses: "Очки (XREAL)" };
 const deviceHints: Record<Device, string> = {
@@ -235,7 +237,36 @@ function Content() {
           </div>
         </PanelSectionRow>
       )}
-      {status && !status.installed && <PanelSectionRow>Модели не установлены.</PanelSectionRow>}
+      {status && !status.installed && (
+        <>
+          <PanelSectionRow>
+            <div style={{ lineHeight: 1.4, fontSize: "0.9em" }}>
+              {status.install.phase === "running"
+                ? `Устанавливаю: ${status.install.step ?? ""}`
+                : "Нужны компоненты: Python, библиотеки и модели (около 300 МБ, нужен интернет)."}
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              disabled={busy || status.install.phase === "running"}
+              onClick={() => void run(installRuntime)}
+            >
+              {status.install.phase === "running" ? "Идёт установка…" : "Установить компоненты"}
+            </ButtonItem>
+          </PanelSectionRow>
+          {status.install.error && (
+            <PanelSectionRow>
+              <div role="alert" style={{ color: "#f4b7ab" }}>{status.install.error}</div>
+            </PanelSectionRow>
+          )}
+        </>
+      )}
+      {status?.installed && status.install.phase === "done" && (
+        <PanelSectionRow>
+          <div style={{ opacity: 0.8, fontSize: "0.9em" }}>Компоненты установлены.</div>
+        </PanelSectionRow>
+      )}
       {message && (
         <PanelSectionRow>
           <div role="alert" style={{ color: "#f4b7ab" }}>{message}</div>

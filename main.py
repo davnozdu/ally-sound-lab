@@ -41,6 +41,8 @@ class Plugin:
         self.live_neural = True
         self.live_status = {}
         self.bypass = False
+        self.installer = None
+        self.install_status = {}
         self.app = {"id": 0, "name": ""}
         self.restarts = []
         # Leftovers from the removed TIGER-DnR file renderer.
@@ -114,6 +116,7 @@ class Plugin:
             "default": self.settings["default"],
             "devices": self.settings["devices"],
             "live": self.live_status,
+            "install": self.install_status,
         }
 
     # -- processes --------------------------------------------------------
@@ -320,6 +323,45 @@ class Plugin:
             await self._command(devices=self.settings["devices"])
         return await self.get_status()
 
+    async def install_runtime(self):
+        """Download uv (if missing), Python 3.13, libraries and models."""
+        async with self.lock:
+            if self.installer is not None and self.installer.returncode is None:
+                raise RuntimeError("Установка уже идёт.")
+            script = PLUGIN_DIR / "install-runtime.sh"
+            if not script.is_file():
+                raise RuntimeError("В плагине нет install-runtime.sh.")
+            self.install_status = {"phase": "running", "step": "Запуск"}
+            self.installer = await self._spawn("/bin/bash", script)
+            self._watch(self._watch_installer(self.installer))
+        return await self.get_status()
+
+    async def _watch_installer(self, process):
+        last = ""
+        async for raw in process.stdout:
+            line = raw.decode(errors="replace").strip()
+            if line.startswith("## "):
+                last = line[3:]
+                self.install_status = {"phase": "running", "step": last}
+        code = await process.wait()
+        if self.installer is not process:
+            return
+        self.installer = None
+        status = await self.get_status()
+        if code == 0 and status["installed"]:
+            self.install_status = {"phase": "done"}
+            decky.logger.info("Runtime installed")
+            async with self.lock:
+                if self.live is None and self._effective()["mode"] != "off":
+                    try:
+                        await self._apply()
+                    except Exception as exc:
+                        self.live_status = {"error": str(exc)}
+        else:
+            reason = last if last.startswith("Ошибка") else f"код {code}, шаг «{last}»"
+            self.install_status = {"phase": "error", "error": f"Установка не удалась ({reason}). Подробности в worker.log."}
+            decky.logger.error("Runtime install failed: %s", reason)
+
     async def set_bypass(self, enabled):
         if not isinstance(enabled, bool):
             raise ValueError("Ожидалось true/false.")
@@ -333,6 +375,8 @@ class Plugin:
         async with self.lock:
             process, self.live = self.live, None
             await self._stop(process)
+            installer, self.installer = self.installer, None
+            await self._stop(installer)
             # Watchers may be waiting on self.lock (auto-restart); cancel them
             # instead of awaiting, or unload would deadlock.
             for task in list(self.workers):
