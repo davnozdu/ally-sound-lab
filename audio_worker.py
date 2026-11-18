@@ -227,15 +227,15 @@ SURROUND_MAP = ",".join(CHANNELS)
 # page fault, a scene hitch at game start) leaves the sound seconds behind the
 # picture for the rest of the session. Cap the buffered audio instead, so a
 # stall costs a short dropout rather than permanent lag.
-RECORD_CAP = 65536   # bytes: 46 ms of 8-channel float32 at 44100
-PLAYBACK_CAP = 32768  # bytes: 93 ms of stereo float32 at 44100
+RECORD_CAP = 32768   # bytes: 23 ms of 8-channel float32 at 44100
+PLAYBACK_CAP = 16384  # bytes: 46 ms of stereo float32 at 44100
 # A single block takes 2.9 ms, so a read that waits this long means the process
 # or the graph stalled and audio queued up somewhere behind us. That backlog is
 # stale by definition: re-open both ends instead of playing it late forever.
 STALL_SECONDS = 0.25
 COMMON = [
     "--raw", "--format=float32le", f"--rate={RATE}",
-    "--latency-msec=20", "--process-time-msec=4", "--client-name=Ally Sound Lab",
+    "--latency-msec=12", "--process-time-msec=2", "--client-name=Ally Sound Lab",
 ]
 
 
