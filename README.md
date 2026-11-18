@@ -1,6 +1,6 @@
 # Ally Sound Lab
 
-[Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for the ROG Ally / Xbox Ally X on CachyOS. Real-time virtual 7.1 / stereo-to-3D upmix with a neural voice separator for headphones, the built-in speakers and XREAL glasses, with per-app profiles, in Game Mode.
+[Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for the ROG Ally / Xbox Ally X on CachyOS. Real-time virtual 7.1 / stereo-to-3D upmix for headphones, the built-in speakers and XREAL glasses, with per-app profiles and a neural voice separator for films, in Game Mode.
 
 Плагин Decky для ROG Ally на CachyOS. Перехватывает весь звук игр и фильмов в игровом режиме, делает из него объёмный звук для наушников, встроенных динамиков или очков XREAL и отдаёт на текущий аудиовыход.
 
@@ -60,8 +60,9 @@
 
 - 5.1/7.1 без нейросети — около 0,3 мс;
 - стерео с матрицей — около 0,6 мс;
-- стерео со StemgenRT или 5.1 с исправлением дубляжа — около 1,0–1,35 мс. Модель (~0,9 мс) считается в отдельном потоке конвейером, на один блок позади.
-- На тишине модель не запускается.
+- стерео со StemgenRT или 5.1 с исправлением дубляжа — около 1,0–1,35 мс. Модель считается в отдельном потоке конвейером, на один блок позади.
+
+Замер на живой игре: сам инференс занимает ~2,6 мс на блок при бюджете 2,9 мс, то есть ~90% ядра ипочти без запаса. Поэтому в профиле «Игра» модель не запускается: успеть она не может, а каждый пропущенный блок гасит центр — слышно как треск на диалогах и звуках меню. Игры работают на пассивной матрице (им хватает настоящих каналов), нейросеть остаётся в профиле «Кино». Очередь модели неблокирующая: если результат не успел, блок идёт без разделения голоса, без задержки и без провала. На тишине модель не запускается.
 
 ## Маршрутизация
 
