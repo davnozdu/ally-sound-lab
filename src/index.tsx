@@ -1,28 +1,62 @@
 import { callable, definePlugin } from "@decky/api";
-import { ButtonItem, DropdownItem, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
+import { DropdownItem, PanelSection, PanelSectionRow, ToggleField, staticClasses } from "@decky/ui";
 import { useEffect, useState } from "react";
 import { FaHeadphones } from "react-icons/fa";
 
-type Mode = "off" | "hrtf" | "stemgen";
-type Variant = "original" | "hrtf" | "stemgen";
+type Mode = "off" | "game" | "movie";
 
 interface Status {
   installed: boolean;
   mode: Mode;
   wanted: Mode;
-  live: { phase?: string; output?: string; error?: string; avg_ms?: number; slow_blocks?: number };
-  playing: boolean;
+  neural: boolean;
+  bypass: boolean;
+  app: { id: number; name: string };
+  custom: boolean;
+  default: { mode: Mode; neural: boolean };
+  live: {
+    phase?: string;
+    output?: string;
+    error?: string;
+    avg_ms?: number;
+    slow_blocks?: number;
+    source?: "stereo" | "surround";
+  };
 }
 
 const getStatus = callable<[], Status>("get_status");
 const setLive = callable<[Mode], Status>("set_live");
-const playAudio = callable<["demo", Variant], Status>("play_audio");
-const stopAudio = callable<[], Status>("stop_audio");
+const setBypass = callable<[boolean], Status>("set_bypass");
+const setNeural = callable<[boolean], Status>("set_neural");
+const resetApp = callable<[], Status>("reset_app");
+const appChanged = callable<[number, string], Status>("app_changed");
 
-const variants: Record<Variant, string> = {
-  original: "Исходное стерео",
-  hrtf: "Обычный HRTF",
-  stemgen: "StemgenRT + HRTF",
+// Follow the foreground app for the whole Steam session, not only while the
+// quick-access menu is open, so per-app profiles switch automatically.
+let reportedApp = -1;
+function syncForegroundApp() {
+  const app = SteamUIStore?.MainRunningApp;
+  const id = app?.appid ?? 0;
+  if (id === reportedApp) return;
+  reportedApp = id;
+  appChanged(id, app?.display_name ?? "").catch(() => {
+    reportedApp = -1; // retry on the next tick
+  });
+}
+
+const labels: Record<Mode, string> = { off: "Выключено", game: "Игра", movie: "Кино" };
+
+const BUDGET_MS = (128 / 44100) * 1000;
+
+const descriptions: Record<Mode, string> = {
+  off: "Звук идёт без изменений.",
+  game: "Точное направление звуков, маленькая комната, динамика не трогается.",
+  movie: "Диалоги громче и в центре, громкие сцены сглажены, комната больше.",
+};
+
+const sources: Record<string, string> = {
+  surround: "Источник 5.1/7.1: каждый канал на своём месте",
+  stereo: "Источник стерео: объём строится из двух каналов",
 };
 
 // Decky rejects with name "Python Exception"; the real message is the last
@@ -73,61 +107,122 @@ function Content() {
   };
 
   const live = status?.live;
-  const active = !!status && status.mode !== "off";
+  const selected: Mode = status?.wanted ?? status?.mode ?? "off";
+  const running = !!status && status.mode !== "off" && live?.phase === "live";
   const message = error || live?.error;
-  const demoButtons = (["original", "hrtf", "stemgen"] as const).map((variant) => (
-    <PanelSectionRow key={variant}>
-      <ButtonItem disabled={busy || active} onClick={() => void run(() => playAudio("demo", variant))}>
-        {variants[variant]}
-      </ButtonItem>
-    </PanelSectionRow>
-  ));
+  const inApp = !!status?.app.id;
+  const profileValue = inApp && !status?.custom ? "default" : selected;
+  const profileOptions = [
+    ...(inApp ? [{ data: "default", label: `Как по умолчанию (${labels[status!.default.mode]})` }] : []),
+    { data: "off", label: labels.off },
+    { data: "game", label: labels.game },
+    { data: "movie", label: labels.movie },
+  ];
+  const load = live?.avg_ms !== undefined ? Math.round((live.avg_ms / BUDGET_MS) * 100) : undefined;
 
   return (
-    <>
-      <PanelSection title="Звук игры">
+    <PanelSection title="Объёмный звук в наушниках">
+      <PanelSectionRow>
+        <div style={{ opacity: 0.85, fontSize: "0.9em" }}>
+          {inApp ? (
+            <>
+              Сейчас: <b>{status?.app.name || `приложение ${status?.app.id}`}</b>
+              {status?.custom ? " · свой профиль" : " · профиль по умолчанию"}
+            </>
+          ) : (
+            "Нет запущенной игры: настраивается профиль по умолчанию"
+          )}
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DropdownItem
+          label={inApp ? "Профиль для этого приложения" : "Профиль по умолчанию"}
+          description={descriptions[selected]}
+          disabled={busy || !status?.installed}
+          selectedOption={profileValue}
+          rgOptions={profileOptions}
+          onChange={(option) =>
+            void run(() => (option.data === "default" ? resetApp() : setLive(option.data as Mode)))
+          }
+        />
+      </PanelSectionRow>
+      {selected !== "off" && (
         <PanelSectionRow>
-          <DropdownItem
-            label="Обработка"
-            description="Весь звук игр и фильмов идёт через обработку. Режим сохраняется после перезагрузки."
-            disabled={busy || !status?.installed}
-            selectedOption={status?.wanted ?? status?.mode ?? "off"}
-            rgOptions={[
-              { data: "off", label: "Выключена" },
-              { data: "hrtf", label: "Обычный HRTF" },
-              { data: "stemgen", label: "StemgenRT + HRTF" },
-            ]}
-            onChange={(option) => void run(() => setLive(option.data as Mode))}
+          <ToggleField
+            label="Нейросеть для стерео"
+            description={
+              status?.neural
+                ? "StemgenRT отделяет голос и ставит его в центр. Лучше для дубляжа, но больше нагрузка на CPU."
+                : "Простая матрица без нейросети: меньше нагрузка, голос отделяется грубее."
+            }
+            checked={!!status?.neural}
+            disabled={busy}
+            onChange={(enabled) => void run(() => setNeural(enabled))}
           />
         </PanelSectionRow>
-        {(live?.phase === "starting" || active) && (
-          <PanelSectionRow>
-            <div style={{ lineHeight: 1.45, opacity: 0.85 }}>
-              {live?.phase === "starting" ? "Подключаю обработку…" : live?.output}
-              {live?.avg_ms !== undefined && (
-                <div>{live.avg_ms} мс на блок · превышений бюджета {live.slow_blocks}</div>
-              )}
-            </div>
-          </PanelSectionRow>
-        )}
-        {status && !status.installed && <PanelSectionRow>Модели не установлены.</PanelSectionRow>}
-        {message && <PanelSectionRow><div role="alert" style={{ color: "#f4b7ab" }}>{message}</div></PanelSectionRow>}
-      </PanelSection>
-      <PanelSection title="Сравнение на готовом отрывке">
-        {demoButtons}
-        {status?.playing && (
-          <PanelSectionRow>
-            <ButtonItem disabled={busy} onClick={() => void run(stopAudio)}>Остановить</ButtonItem>
-          </PanelSectionRow>
-        )}
-      </PanelSection>
-    </>
+      )}
+      {selected !== "off" && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Сравнить с оригиналом"
+            description="Временно отключает обработку, громкость выровнена."
+            checked={!!status?.bypass}
+            disabled={busy || !running}
+            onChange={(enabled) => void run(() => setBypass(enabled))}
+          />
+        </PanelSectionRow>
+      )}
+      {selected !== "off" && (
+        <PanelSectionRow>
+          <div style={{ lineHeight: 1.45, opacity: 0.85, fontSize: "0.9em" }}>
+            {!running ? (
+              "Подключаю обработку…"
+            ) : (
+              <>
+                <div>Выход: {live?.output}</div>
+                {live?.source && <div>{sources[live.source]}</div>}
+                {load !== undefined && (
+                  <div>
+                    Нагрузка {load}% бюджета · пропусков {live?.slow_blocks ?? 0}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </PanelSectionRow>
+      )}
+      {selected !== "off" && running && (
+        <PanelSectionRow>
+          <div style={{ lineHeight: 1.4, opacity: 0.65, fontSize: "0.85em" }}>
+            Игры выбирают число каналов при запуске: включай обработку до запуска игры или фильма.
+          </div>
+        </PanelSectionRow>
+      )}
+      {status && !status.installed && <PanelSectionRow>Модели не установлены.</PanelSectionRow>}
+      {message && (
+        <PanelSectionRow>
+          <div role="alert" style={{ color: "#f4b7ab" }}>{message}</div>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
   );
 }
 
-export default definePlugin(() => ({
-  name: "Ally Sound Lab",
-  titleView: <div className={staticClasses.Title}>Ally Sound Lab</div>,
-  content: <Content />,
-  icon: <FaHeadphones />,
-}));
+export default definePlugin(() => {
+  const lifetime = SteamClient.GameSessions.RegisterForAppLifetimeNotifications(() => {
+    // The store updates slightly after the notification.
+    setTimeout(syncForegroundApp, 1500);
+  });
+  const timer = setInterval(syncForegroundApp, 5000);
+  syncForegroundApp();
+  return {
+    name: "Ally Sound Lab",
+    titleView: <div className={staticClasses.Title}>Ally Sound Lab</div>,
+    content: <Content />,
+    icon: <FaHeadphones />,
+    onDismount() {
+      lifetime.unregister();
+      clearInterval(timer);
+    },
+  };
+});

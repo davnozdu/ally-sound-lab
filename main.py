@@ -10,78 +10,110 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 USER_HOME = Path(decky.DECKY_USER_HOME)
 DATA_DIR = USER_HOME / ".local" / "share" / "ally-sound-npu"
 PYTHON = DATA_DIR / ".venv" / "bin" / "python"
-SAMPLE_DIR = USER_HOME / "Downloads" / "AllySoundNPU"
-DEMO = {
-    "original": "01-stereo.wav",
-    "hrtf": "02-hrtf.wav",
-    "stemgen": "04-stemgen-hrtf.wav",
-}
 MODELS = ("vocals.onnx", "ku100.sofa")
 SETTINGS = DATA_DIR / "settings.json"
 WORKER_LOG = DATA_DIR / "worker.log"
-LIVE_MODES = {"off", "hrtf", "stemgen"}
+PROFILES = {"game", "movie"}
+LIVE_MODES = {"off"} | PROFILES
+DEFAULT = {"mode": "off", "neural": True}
 RESTART_LIMIT = 5        # unexpected live-worker exits tolerated...
 RESTART_WINDOW = 120     # ...within this many seconds
+
+
+def clean_entry(entry, fallback):
+    mode = entry.get("mode", fallback["mode"]) if isinstance(entry, dict) else fallback["mode"]
+    # Modes from the first version ("hrtf", "stemgen") map onto profiles.
+    mode = {"hrtf": "game", "stemgen": "movie"}.get(mode, mode)
+    neural = entry.get("neural", fallback["neural"]) if isinstance(entry, dict) else fallback["neural"]
+    return {
+        "mode": mode if mode in LIVE_MODES else fallback["mode"],
+        "neural": neural if isinstance(neural, bool) else fallback["neural"],
+    }
 
 
 class Plugin:
     async def _main(self):
         self.lock = asyncio.Lock()
         self.live = None
-        self.player = None
         self.workers = set()
         self.live_mode = "off"
+        self.live_neural = True
         self.live_status = {}
+        self.bypass = False
+        self.app = {"id": 0, "name": ""}
+        self.restarts = []
         # Leftovers from the removed TIGER-DnR file renderer.
         for stale in DATA_DIR.glob("render-*"):
             shutil.rmtree(stale, ignore_errors=True)
-        self.wanted = self._load_mode()
-        self.restarts = []
-        decky.logger.info("Ally Sound Lab initialized, saved mode %s", self.wanted)
-        if self.wanted != "off":
-            self._watch(self._autostart())
+        self.settings = self._load_settings()
+        decky.logger.info("Ally Sound Lab initialized, default %s", self.settings["default"])
+        self._watch(self._autostart())
 
-    def _load_mode(self):
+    # -- settings ---------------------------------------------------------
+
+    def _load_settings(self):
         try:
-            mode = json.loads(SETTINGS.read_text()).get("mode", "off")
-        except (OSError, ValueError, AttributeError):
-            return "off"
-        return mode if mode in LIVE_MODES else "off"
+            raw = json.loads(SETTINGS.read_text())
+        except (OSError, ValueError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        if "default" not in raw and "mode" in raw:  # first-version file
+            raw = {"default": {"mode": raw["mode"]}}
+        default = clean_entry(raw.get("default", {}), DEFAULT)
+        apps = {}
+        for appid, entry in (raw.get("apps") or {}).items():
+            if str(appid).isdigit() and isinstance(entry, dict):
+                apps[str(appid)] = {**clean_entry(entry, default), "name": str(entry.get("name", ""))[:120]}
+        return {"default": default, "apps": apps}
 
-    def _save_mode(self, mode):
-        self.wanted = mode
+    def _save_settings(self):
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            SETTINGS.write_text(json.dumps({"mode": mode}))
+            temporary = SETTINGS.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self.settings, ensure_ascii=False, indent=1))
+            temporary.replace(SETTINGS)
         except OSError as exc:
-            decky.logger.warning("Cannot save mode: %s", exc)
+            decky.logger.warning("Cannot save settings: %s", exc)
 
-    async def _autostart(self):
-        # At boot Decky can start before the user's PipeWire session.
-        pulse = Path(f"/run/user/{os.getuid()}/pulse/native")
-        for _ in range(60):
-            if pulse.exists():
-                break
-            await asyncio.sleep(2)
-        await asyncio.sleep(3)
-        async with self.lock:
-            if self.live is None and self.wanted != "off":
-                try:
-                    await self._start_live(self.wanted)
-                except Exception as exc:
-                    self.live_status = {"error": f"Автозапуск не удался: {exc}"}
-                    decky.logger.error("Autostart failed: %s", exc)
+    def _app_entry(self):
+        return self.settings["apps"].get(str(self.app["id"])) if self.app["id"] else None
+
+    def _effective(self):
+        entry = self._app_entry()
+        source = entry or self.settings["default"]
+        return {"mode": source["mode"], "neural": source["neural"]}
+
+    def _edit_context(self, **changes):
+        """Apply changes to the running app's own entry, or to the default."""
+        if self.app["id"]:
+            key = str(self.app["id"])
+            entry = self.settings["apps"].get(key) or dict(self.settings["default"])
+            entry.update(changes, name=self.app["name"])
+            self.settings["apps"][key] = entry
+        else:
+            self.settings["default"].update(changes)
+        self._save_settings()
+
+    # -- status -----------------------------------------------------------
 
     async def get_status(self):
+        effective = self._effective()
         return {
             "installed": PYTHON.is_file() and all((DATA_DIR / "models" / name).is_file() for name in MODELS),
             "mode": self.live_mode,
-            "wanted": self.wanted,
+            "wanted": effective["mode"],
+            "neural": effective["neural"],
+            "bypass": self.bypass,
+            "app": self.app,
+            "custom": self._app_entry() is not None,
+            "default": self.settings["default"],
             "live": self.live_status,
-            "playing": self.player is not None and self.player.returncode is None,
         }
 
-    async def _spawn(self, *args, capture=False):
+    # -- processes --------------------------------------------------------
+
+    async def _spawn(self, *args):
         if os.geteuid() == 0:
             raise RuntimeError("Ally Sound Lab должен запускаться от пользователя Steam.")
         env = os.environ.copy()
@@ -90,8 +122,8 @@ class Plugin:
         env["PULSE_SERVER"] = f"unix:{env['XDG_RUNTIME_DIR']}/pulse/native"
         env["OPENBLAS_NUM_THREADS"] = "1"
         # Decky is a PyInstaller bundle: its LD_LIBRARY_PATH points at a bundled
-        # libstdc++ that is older than the system one, which breaks mpv and
-        # anything else linked against current CachyOS libraries.
+        # libstdc++ that is older than the system one, which breaks programs
+        # linked against current CachyOS libraries.
         for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH"):
             env.pop(name, None)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -104,7 +136,8 @@ class Plugin:
             return await asyncio.create_subprocess_exec(
                 *args,
                 env=env,
-                stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=log,
             )
 
@@ -127,7 +160,55 @@ class Plugin:
                 process.kill()
             await process.wait()
 
-    async def _watch_live(self, process, mode):
+    async def _command(self, **fields):
+        """Send a control message to the running worker (no audio restart)."""
+        process = self.live
+        if process is None or process.returncode is not None or process.stdin is None:
+            return False
+        try:
+            process.stdin.write((json.dumps(fields) + "\n").encode())
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+        return True
+
+    async def _start_live(self, mode, neural):
+        """Start the live worker. Caller holds self.lock."""
+        if not PYTHON.is_file():
+            raise RuntimeError("Модели ещё не установлены.")
+        args = [PYTHON, PLUGIN_DIR / "audio_worker.py", "live", mode]
+        if not neural:
+            args.append("--no-neural")
+        self.live_status = {"phase": "starting"}
+        self.live = await self._spawn(*args)
+        self.live_mode = mode
+        self.live_neural = neural
+        if self.bypass:
+            await self._command(bypass=True)
+        self._watch(self._watch_live(self.live))
+
+    async def _apply(self):
+        """Bring the worker in line with the effective settings. Caller holds self.lock."""
+        target = self._effective()
+        if target["mode"] == "off":
+            process, self.live = self.live, None
+            await self._stop(process)
+            self.live_mode = "off"
+            self.live_status = {}
+            self.bypass = False
+            return
+        if self.live is not None and self.live_mode in PROFILES:
+            # Profile and network switch instantly inside the running worker.
+            if await self._command(profile=target["mode"], neural=target["neural"]):
+                self.live_mode = target["mode"]
+                self.live_neural = target["neural"]
+                self.live_status = {**self.live_status, "profile": target["mode"], "neural": target["neural"]}
+                return
+        process, self.live = self.live, None
+        await self._stop(process)
+        await self._start_live(target["mode"], target["neural"])
+
+    async def _watch_live(self, process):
         async for line in process.stdout:
             try:
                 event = json.loads(line)
@@ -144,73 +225,92 @@ class Plugin:
         decky.logger.warning("Live worker exited (%s): %s", result, error)
         now = asyncio.get_running_loop().time()
         self.restarts = [moment for moment in self.restarts if now - moment < RESTART_WINDOW]
-        if self.wanted != mode or len(self.restarts) >= RESTART_LIMIT:
+        if self._effective()["mode"] == "off" or len(self.restarts) >= RESTART_LIMIT:
             self.live_status = {"error": error}
             return
         self.restarts.append(now)
         self.live_status = {"phase": "starting", "error": f"Перезапуск после сбоя: {error}"}
         await asyncio.sleep(2)
         async with self.lock:
-            if self.live is None and self.wanted == mode:
+            if self.live is None:
                 try:
-                    await self._start_live(mode)
+                    await self._apply()
                 except Exception as exc:
                     self.live_status = {"error": str(exc)}
 
-    async def _start_live(self, mode):
-        """Start the live worker. Caller holds self.lock."""
-        if not PYTHON.is_file():
-            raise RuntimeError("Модели ещё не установлены.")
-        await self._stop(self.player)
-        self.player = None
-        self.live_status = {"phase": "starting"}
-        self.live = await self._spawn(PYTHON, PLUGIN_DIR / "audio_worker.py", "live", mode, capture=True)
-        self.live_mode = mode
-        self._watch(self._watch_live(self.live, mode))
+    async def _autostart(self):
+        # At boot Decky can start before the user's PipeWire session.
+        pulse = Path(f"/run/user/{os.getuid()}/pulse/native")
+        for _ in range(60):
+            if pulse.exists():
+                break
+            await asyncio.sleep(2)
+        await asyncio.sleep(3)
+        async with self.lock:
+            if self.live is None and self._effective()["mode"] != "off":
+                try:
+                    await self._apply()
+                except Exception as exc:
+                    self.live_status = {"error": f"Автозапуск не удался: {exc}"}
+                    decky.logger.error("Autostart failed: %s", exc)
+
+    # -- frontend API -----------------------------------------------------
+
+    async def app_changed(self, appid, name):
+        """Called by the frontend whenever the foreground Steam app changes."""
+        appid = int(appid) if isinstance(appid, (int, float)) and appid > 0 else 0
+        name = str(name or "")[:120] if appid else ""
+        async with self.lock:
+            if appid == self.app["id"]:
+                return await self.get_status()
+            self.app = {"id": appid, "name": name}
+            entry = self._app_entry()
+            if entry is not None and name and entry.get("name") != name:
+                entry["name"] = name
+                self._save_settings()
+            self.restarts = []
+            decky.logger.info("Foreground app %s (%s): %s", appid, name, self._effective())
+            await self._apply()
+        return await self.get_status()
 
     async def set_live(self, mode):
         if mode not in LIVE_MODES:
             raise ValueError("Неизвестный режим.")
         async with self.lock:
-            self._save_mode(mode)
+            self._edit_context(mode=mode)
             self.restarts = []
-            process, self.live = self.live, None
-            await self._stop(process)
-            self.live_mode = "off"
-            self.live_status = {}
-            if mode != "off":
-                await self._start_live(mode)
+            await self._apply()
         return await self.get_status()
 
-    async def play_audio(self, collection, variant):
-        if collection == "demo" and variant in DEMO:
-            file = SAMPLE_DIR / DEMO[variant]
-        else:
-            raise ValueError("Тестовый файл недоступен.")
+    async def set_neural(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError("Ожидалось true/false.")
         async with self.lock:
-            if self.live is not None:
-                raise RuntimeError("Выключи живую обработку, чтобы не применять HRTF дважды.")
-            if not file.is_file():
-                raise FileNotFoundError(file.name)
-            await self._stop(self.player)
-            self.player = await self._spawn(
-                "/usr/bin/env", "DISABLE_NPU_SR=1", "/usr/bin/mpv", "--no-config",
-                "--no-video", "--force-window=no", "--ao=pipewire", "--", file,
-            )
+            self._edit_context(neural=enabled)
+            await self._apply()
         return await self.get_status()
 
-    async def stop_audio(self):
+    async def reset_app(self):
+        """Forget the running app's own settings; it follows the default again."""
         async with self.lock:
-            await self._stop(self.player)
-            self.player = None
+            if self.settings["apps"].pop(str(self.app["id"]), None) is not None:
+                self._save_settings()
+            await self._apply()
+        return await self.get_status()
+
+    async def set_bypass(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError("Ожидалось true/false.")
+        async with self.lock:
+            self.bypass = enabled
+            await self._command(bypass=enabled)
+            self.live_status = {**self.live_status, "bypass": enabled}
         return await self.get_status()
 
     async def _unload(self):
         async with self.lock:
-            processes = (self.live, self.player)
-            self.live = self.player = None
-            for process in processes:
-                await self._stop(process)
+            process, self.live = self.live, None
+            await self._stop(process)
             # Watchers may be waiting on self.lock (auto-restart); cancel them
             # instead of awaiting, or unload would deadlock.
             for task in list(self.workers):

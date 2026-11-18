@@ -1,20 +1,20 @@
 import argparse
 import fcntl
 import json
+import os
 from pathlib import Path
 from queue import Empty, Queue
 import signal
 import subprocess
+import sys
 from threading import Event, Thread
 from time import monotonic, perf_counter
 
-import h5py
 import numpy as np
 import onnxruntime as ort
-from scipy import signal as dsp
 
-RATE = 44100
-HOP = 128
+from spatial import CHANNELS, HOP, PROFILES, RATE, Renderer
+
 SINK = "ally_sound_lab"
 RUNTIME_DIR = Path.home() / ".local" / "share" / "ally-sound-npu"
 MODELS = RUNTIME_DIR / "models"
@@ -41,46 +41,6 @@ def runtime(name, threads):
     return ort.InferenceSession(str(MODELS / name), options, providers=["CPUExecutionProvider"])
 
 
-def impulse_responses():
-    with h5py.File(MODELS / "ku100.sofa", "r") as file:
-        positions = file["SourcePosition"][:]
-        indices = [
-            np.argmin(np.abs((positions[:, 0] - angle + 180) % 360 - 180) + np.abs(positions[:, 1]))
-            for angle in (30, 330, 110, 250)
-        ]
-        responses = np.stack([file["Data.IR"][index] for index in indices])
-    return dsp.resample_poly(responses, 147, 160, axis=-1).astype(np.float32)
-
-
-def surround_inputs(stereo, mode, auxiliary=None):
-    if mode == "hrtf":
-        side = (stereo[0] - stereo[1]) * 0.325
-        surround = np.stack((side, -side))
-    else:
-        surround = auxiliary * 0.22
-    return np.vstack((stereo, surround))
-
-
-class Headphones:
-    def __init__(self):
-        self.responses = impulse_responses()
-        self.state = np.zeros((4, 2, self.responses.shape[-1] - 1), dtype=np.float32)
-        self.denominator = np.ones(1, dtype=np.float32)
-
-    def render(self, sources):
-        ears = np.zeros((2, sources.shape[-1]), dtype=np.float32)
-        for source in range(4):
-            for ear in range(2):
-                result, self.state[source, ear] = dsp.lfilter(
-                    self.responses[source, ear],
-                    self.denominator,
-                    sources[source],
-                    zi=self.state[source, ear],
-                )
-                ears[ear] += result
-        return ears
-
-
 class Vocals:
     def __init__(self):
         self.session = runtime("vocals.onnx", 1)
@@ -99,6 +59,51 @@ class Vocals:
         dry = self.previous
         self.previous = audio
         return dry, dry - vocals[0, 0]
+
+
+class PipelinedVocals:
+    """Runs StemgenRT on its own thread, one block behind the audio thread.
+
+    ONNX Runtime releases the GIL, so inference of block N overlaps with the
+    spatial rendering of block N-1 on another core. Costs one extra hop of
+    latency (2.9 ms) and roughly halves the per-block time on the audio thread.
+    """
+
+    def __init__(self, vocals):
+        self.vocals = vocals
+        self.inbox = Queue(maxsize=1)
+        self.outbox = Queue(maxsize=1)
+        self.pending = False
+        Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            audio = self.inbox.get()
+            self.outbox.put(self.vocals.process(audio))
+
+    def reset(self):
+        """Drop a result left over from before a pause in stereo input."""
+        if self.pending:
+            self.outbox.get()
+            self.pending = False
+
+    def process(self, audio):
+        previous = self.outbox.get() if self.pending else None
+        self.inbox.put(np.array(audio, dtype=np.float32, copy=True))
+        self.pending = True
+        if previous is None:
+            silence = np.zeros_like(audio)
+            return silence, silence
+        return previous
+
+
+def realtime_priority():
+    """Ask for SCHED_RR like PipeWire clients do; harmless if not permitted."""
+    try:
+        os.sched_setscheduler(0, os.SCHED_RR, os.sched_param(10))
+        return True
+    except (AttributeError, PermissionError, OSError):
+        return False
 
 
 def interrupt(_number, _frame):
@@ -143,15 +148,16 @@ def recover_route():
     ROUTE_STATE.unlink(missing_ok=True)
 
 
-def run_live(mode):
+def run_live(profile, neural):
     with (RUNTIME_DIR / "live.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         recover_route()
-        process_live(mode)
+        process_live(profile, neural)
 
 
+SURROUND_MAP = ",".join(CHANNELS)
 COMMON = [
-    "--raw", "--format=float32le", f"--rate={RATE}", "--channels=2",
+    "--raw", "--format=float32le", f"--rate={RATE}",
     "--latency-msec=28", "--process-time-msec=4", "--client-name=Ally Sound Lab",
 ]
 
@@ -159,7 +165,8 @@ COMMON = [
 def open_playback(target):
     return subprocess.Popen(
         ["/usr/bin/pacat", "--playback", f"--device={target}", "--volume=65536",
-         "--property=node.dont-reconnect=true", "--property=node.dont-move=true", *COMMON],
+         "--property=node.dont-reconnect=true", "--property=node.dont-move=true",
+         "--channels=2", "--channel-map=front-left,front-right", *COMMON],
         stdin=subprocess.PIPE,
         bufsize=0,
     )
@@ -167,7 +174,8 @@ def open_playback(target):
 
 def open_record():
     return subprocess.Popen(
-        ["/usr/bin/parec", f"--device={SINK}.monitor", *COMMON],
+        ["/usr/bin/parec", f"--device={SINK}.monitor",
+         f"--channels={len(CHANNELS)}", f"--channel-map={SURROUND_MAP}", *COMMON],
         stdout=subprocess.PIPE,
     )
 
@@ -192,9 +200,27 @@ def capture_streams(source, own_pid):
                 pass
 
 
-def process_live(mode):
-    renderer = Headphones()
-    model = Vocals() if mode == "stemgen" else None
+def read_commands(pending):
+    """Control channel from the plugin backend: one JSON object per line."""
+    for line in sys.stdin:
+        try:
+            command = json.loads(line)
+        except ValueError:
+            continue
+        if command.get("profile") in PROFILES:
+            pending["profile"] = command["profile"]
+        for flag in ("bypass", "neural"):
+            if isinstance(command.get(flag), bool):
+                pending[flag] = command[flag]
+
+
+def process_live(profile, neural):
+    realtime = realtime_priority()  # threads started below inherit it
+    renderer = Renderer(
+        MODELS / "ku100.sofa", vocals=PipelinedVocals(Vocals()), profile=profile, neural=neural,
+    )
+    pending = {}
+    Thread(target=read_commands, args=(pending,), daemon=True).start()
     target = pulse("get-default-sink")
     if target == SINK or SINK in sinks():
         raise RuntimeError("Аудиовыход Ally Sound Lab уже существует.")
@@ -206,7 +232,7 @@ def process_live(mode):
     finished = Event()
     disconnect = Event()
     retarget = Queue()
-    chunk_bytes = HOP * 2 * 4
+    chunk_bytes = HOP * len(CHANNELS) * 4
 
     def route_to(new_target):
         nonlocal target
@@ -262,7 +288,7 @@ def process_live(mode):
     try:
         module_id = pulse(
             "load-module", "module-null-sink", f"sink_name={SINK}",
-            f"rate={RATE}", "channels=2", "channel_map=front-left,front-right",
+            f"rate={RATE}", f"channels={len(CHANNELS)}", f"channel_map={SURROUND_MAP}",
             "sink_properties=device.description=Ally_Sound_Lab",
         )
         pulse("set-default-sink", SINK)
@@ -280,13 +306,17 @@ def process_live(mode):
                 raise RuntimeError("PipeWire удалил аудиовыход Ally Sound Lab.")
             if len(chunk) != chunk_bytes:
                 raise RuntimeError("PipeWire прервал аудиопоток.")
+            if pending:
+                if "profile" in pending:
+                    renderer.set_profile(pending.pop("profile"))
+                if "bypass" in pending:
+                    renderer.bypass = pending.pop("bypass")
+                if "neural" in pending:
+                    renderer.neural = pending.pop("neural")
+                health_check = 0
             tick = perf_counter()
-            dry = np.frombuffer(chunk, dtype="<f4").reshape(HOP, 2).T
-            auxiliary = None
-            if model is not None:
-                dry, auxiliary = model.process(dry)
-            rendered = renderer.render(surround_inputs(dry, mode, auxiliary))
-            result = np.clip(rendered * 0.70, -0.98, 0.98).T.copy().tobytes()
+            block = np.frombuffer(chunk, dtype="<f4").reshape(HOP, len(CHANNELS)).T
+            result = renderer.process(block).T.copy().tobytes()
             elapsed_ms = (perf_counter() - tick) * 1000
             measured += 1
             missed += elapsed_ms > HOP / RATE * 1000
@@ -305,7 +335,11 @@ def process_live(mode):
                 route_to(new_target)
                 continue
             if monotonic() - health_check >= 2:
-                emit(phase="live", avg_ms=round(total / measured, 2), slow_blocks=missed, blocks=measured)
+                emit(
+                    phase="live", avg_ms=round(total / measured, 2), slow_blocks=missed, blocks=measured,
+                    source=renderer.source, profile=renderer.profile, bypass=renderer.bypass,
+                    neural=renderer.neural, realtime=realtime,
+                )
                 health_check = monotonic()
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -321,12 +355,13 @@ def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     live = commands.add_parser("live")
-    live.add_argument("mode", choices=("hrtf", "stemgen"))
+    live.add_argument("profile", choices=tuple(PROFILES))
+    live.add_argument("--no-neural", dest="neural", action="store_false")
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
-        run_live(args.mode)
+        run_live(args.profile, args.neural)
     except KeyboardInterrupt:
         pass
     except Exception as exc:
