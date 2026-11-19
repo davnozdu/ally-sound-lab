@@ -356,6 +356,7 @@ class Renderer:
         self.speaker_delay = Delay(1, int(0.012 * RATE))
         self.speaker_lfe = Filter(*dsp.butter(2, 120 / (RATE / 2)), 1)
         self.glasses_bass = Filter(*dsp.butter(2, 220 / (RATE / 2)), 2)
+        self.cinema_air = Filter(*dsp.butter(2, 4500 / (RATE / 2), "high"), 2)
         self.set_profile(profile)
 
     def set_device(self, kind, correction_path=None):
@@ -459,6 +460,8 @@ class Renderer:
         # across all channels instead of over-summing smeared dubs into FC.
         gathered = min(float(np.linalg.norm(weights)), 1.25) * voice
         clean[2] += (gathered * self.settings["dialogue"]).astype(np.float32)
+        # Gently lift the clean (voice-free) surrounds for richer immersion.
+        clean[3:7] *= 1.18
         if np.sqrt(np.mean(late[[SL, SR]] ** 2)) <= SILENCE:
             # 5.1: its surround pair sits at ~110 degrees, not behind.
             clean[5:7], clean[3:5] = clean[3:5], 0.0
@@ -466,31 +469,40 @@ class Renderer:
 
     def _stereo_feeds(self, block):
         dry = block[[FL, FR]]
+        lfe = None
         if self.neural and self.settings.get("stereo_model", True) and self._ensure_model():
             dry, sep_rest = self._model(dry)
             # Move 75% of the separated voice to the centre and keep 25% in
             # L/R so dialogue stays natural and blended instead of pushy.
             voice = (dry - sep_rest) * 0.75
-            rest = dry - voice
+            # Enrich only the voice-free stem (music & effects): subtle high-end
+            # air (+2 dB > 4.5 kHz), wider surround spread, and gentle LFE sub.
+            air = self.cinema_air.process(sep_rest) * 0.26
+            rest = (dry - voice + air).astype(np.float32)
+            amb_src = (sep_rest + air).astype(np.float32)
+            side_gain, rear_gain = 0.58, 0.52
+            lfe = (sep_rest.mean(axis=0) * 0.25).astype(np.float32)
         else:
             # Passive upmix: half of the shared (mid) signal becomes the centre.
             # Dialogue is usually centre-panned, so it still lands in front.
             mid = 0.5 * (dry[0] + dry[1])
             voice = np.stack((0.5 * mid, 0.5 * mid))
             rest = dry - voice
+            amb_src = rest
+            side_gain, rear_gain = 0.45, 0.40
         # Ambience = what is not shared by both channels of the remaining mix.
-        ambience = np.stack((rest[0] - 0.7 * rest[1], rest[1] - 0.7 * rest[0]))
+        ambience = np.stack((amb_src[0] - 0.7 * amb_src[1], amb_src[1] - 0.7 * amb_src[0]))
         rear = self.ambience_delay.process(ambience)
         feeds = np.stack((
             rest[0],
             rest[1],
             voice.mean(axis=0) * self.settings["dialogue"],
-            rear[0] * 0.40,
-            rear[1] * 0.40,
-            ambience[0] * 0.45,
-            ambience[1] * 0.45,
+            rear[0] * rear_gain,
+            rear[1] * rear_gain,
+            ambience[0] * side_gain,
+            ambience[1] * side_gain,
         )).astype(np.float32)
-        return feeds, None
+        return feeds, lfe
 
     # -- rendering ------------------------------------------------------
 
