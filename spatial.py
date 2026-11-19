@@ -36,7 +36,7 @@ PROFILES = {
     # Clear dialogue over effects, bigger room, tamed loud scenes. In 5.1/7.1
     # the network gathers voice from every channel into the centre, which
     # repairs dubs that were smeared over all speakers.
-    "movie": {"dialogue": 10 ** (5 / 20), "room": 0.16, "rt60": 0.40, "compress": True,
+    "movie": {"dialogue": 10 ** (2.0 / 20), "room": 0.16, "rt60": 0.40, "compress": True,
               "dub_fix": True, "stereo_model": True},
 }
 ROOM_SECONDS = 0.45
@@ -455,9 +455,9 @@ class Renderer:
         weights = 0.85 * np.maximum(self.voice_xcorr, 0.0) / (self.voice_power + 1e-9)
         parts = np.outer(weights, voice)          # voice found in each channel
         clean = (channels - parts).astype(np.float32)
-        # A voice shared by a speaker pair is heard as their sum; 0.707 keeps
-        # its loudness about the same once it comes from the centre alone.
-        gathered = 0.707 * (parts[0] + parts[1]) + parts[2] + 0.707 * parts[3:].sum(axis=0)
+        # Energy-conserving gather: preserves the voice's original RMS power
+        # across all channels instead of over-summing smeared dubs into FC.
+        gathered = min(float(np.linalg.norm(weights)), 1.25) * voice
         clean[2] += (gathered * self.settings["dialogue"]).astype(np.float32)
         if np.sqrt(np.mean(late[[SL, SR]] ** 2)) <= SILENCE:
             # 5.1: its surround pair sits at ~110 degrees, not behind.
@@ -467,8 +467,11 @@ class Renderer:
     def _stereo_feeds(self, block):
         dry = block[[FL, FR]]
         if self.neural and self.settings.get("stereo_model", True) and self._ensure_model():
-            dry, rest = self._model(dry)
-            voice = dry - rest
+            dry, sep_rest = self._model(dry)
+            # Move 75% of the separated voice to the centre and keep 25% in
+            # L/R so dialogue stays natural and blended instead of pushy.
+            voice = (dry - sep_rest) * 0.75
+            rest = dry - voice
         else:
             # Passive upmix: half of the shared (mid) signal becomes the centre.
             # Dialogue is usually centre-panned, so it still lands in front.
