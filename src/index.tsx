@@ -11,10 +11,11 @@ interface Status {
   mode: Mode;
   wanted: Mode;
   neural: boolean;
+  reverb: boolean;
   bypass: boolean;
   app: { id: number; name: string };
   custom: boolean;
-  default: { mode: Mode; neural: boolean };
+  default: { mode: Mode; neural: boolean; reverb: boolean };
   devices: Record<string, Device>;
   install: { phase?: "running" | "done" | "error"; step?: string; error?: string };
   live: {
@@ -35,11 +36,12 @@ const getStatus = callable<[], Status>("get_status");
 const setLive = callable<[Mode], Status>("set_live");
 const setBypass = callable<[boolean], Status>("set_bypass");
 const setNeural = callable<[boolean], Status>("set_neural");
+const setReverb = callable<[boolean], Status>("set_reverb");
 const resetApp = callable<[], Status>("reset_app");
 const setDeviceKind = callable<[Device | "auto"], Status>("set_device_kind");
 const installRuntime = callable<[], Status>("install_runtime");
 
-const deviceLabels: Record<Device, string> = { headphones: "Наушники", speakers: "Динамики", glasses: "Очки (XREAL)" };
+const deviceLabels: Record<Device, string> = { headphones: "Наушники", speakers: "Динамики", glasses: "Очки (AR / VR)" };
 const deviceHints: Record<Device, string> = {
   headphones: "Полный 3D через HRTF: звук вокруг головы.",
   speakers: "Голос в центре, сцена шире корпуса, мягкая компрессия.",
@@ -162,18 +164,33 @@ function Content() {
           }
         />
       </PanelSectionRow>
-      {selected !== "off" && (
+      {selected === "movie" && (
         <PanelSectionRow>
           <ToggleField
-            label="Нейросеть для стерео"
+            label="Нейросеть (голос и дубляж)"
             description={
               status?.neural
-                ? "StemgenRT отделяет голос и ставит его в центр. Лучше для дубляжа, но больше нагрузка на CPU."
-                : "Простая матрица без нейросети: меньше нагрузка, голос отделяется грубее."
+                ? "StemgenRT отделяет голос в стерео и собирает дубляж 5.1/7.1 в центр."
+                : "Простая матрица без нейросети: меньше нагрузка на CPU, голос отделяется грубее."
             }
             checked={!!status?.neural}
             disabled={busy}
             onChange={(enabled) => void run(() => setNeural(enabled))}
+          />
+        </PanelSectionRow>
+      )}
+      {selected !== "off" && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Реверберация (комната)"
+            description={
+              (status?.reverb ?? true)
+                ? "Добавляет лёгкий объём комнаты. Выключите, если слышно эхо."
+                : "Сухой звук без эха и комнаты, меньше нагрузка на CPU."
+            }
+            checked={status?.reverb ?? true}
+            disabled={busy}
+            onChange={(enabled) => void run(() => setReverb(enabled))}
           />
         </PanelSectionRow>
       )}

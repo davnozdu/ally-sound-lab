@@ -16,7 +16,7 @@ WORKER_LOG = DATA_DIR / "worker.log"
 PROFILES = {"game", "movie"}
 DEVICES = {"headphones", "speakers", "glasses"}
 LIVE_MODES = {"off"} | PROFILES
-DEFAULT = {"mode": "off", "neural": True}
+DEFAULT = {"mode": "off", "neural": True, "reverb": True}
 RESTART_LIMIT = 5        # unexpected live-worker exits tolerated...
 RESTART_WINDOW = 120     # ...within this many seconds
 
@@ -26,9 +26,11 @@ def clean_entry(entry, fallback):
     # Modes from the first version ("hrtf", "stemgen") map onto profiles.
     mode = {"hrtf": "game", "stemgen": "movie"}.get(mode, mode)
     neural = entry.get("neural", fallback["neural"]) if isinstance(entry, dict) else fallback["neural"]
+    reverb = entry.get("reverb", fallback["reverb"]) if isinstance(entry, dict) else fallback["reverb"]
     return {
         "mode": mode if mode in LIVE_MODES else fallback["mode"],
         "neural": neural if isinstance(neural, bool) else fallback["neural"],
+        "reverb": reverb if isinstance(reverb, bool) else fallback["reverb"],
     }
 
 
@@ -39,6 +41,7 @@ class Plugin:
         self.workers = set()
         self.live_mode = "off"
         self.live_neural = True
+        self.live_reverb = True
         self.live_status = {}
         self.bypass = False
         self.installer = None
@@ -88,7 +91,7 @@ class Plugin:
     def _effective(self):
         entry = self._app_entry()
         source = entry or self.settings["default"]
-        return {"mode": source["mode"], "neural": source["neural"]}
+        return {"mode": source["mode"], "neural": source["neural"], "reverb": source["reverb"]}
 
     def _edit_context(self, **changes):
         """Apply changes to the running app's own entry, or to the default."""
@@ -110,6 +113,7 @@ class Plugin:
             "mode": self.live_mode,
             "wanted": effective["mode"],
             "neural": effective["neural"],
+            "reverb": effective["reverb"],
             "bypass": self.bypass,
             "app": self.app,
             "custom": self._app_entry() is not None,
@@ -180,17 +184,20 @@ class Plugin:
             return False
         return True
 
-    async def _start_live(self, mode, neural):
+    async def _start_live(self, mode, neural, reverb):
         """Start the live worker. Caller holds self.lock."""
         if not PYTHON.is_file():
             raise RuntimeError("Модели ещё не установлены.")
         args = [PYTHON, PLUGIN_DIR / "audio_worker.py", "live", mode]
         if not neural:
             args.append("--no-neural")
+        if not reverb:
+            args.append("--no-reverb")
         self.live_status = {"phase": "starting"}
         self.live = await self._spawn(*args)
         self.live_mode = mode
         self.live_neural = neural
+        self.live_reverb = reverb
         await self._command(devices=self.settings["devices"])
         if self.bypass:
             await self._command(bypass=True)
@@ -207,15 +214,21 @@ class Plugin:
             self.bypass = False
             return
         if self.live is not None and self.live_mode in PROFILES:
-            # Profile and network switch instantly inside the running worker.
-            if await self._command(profile=target["mode"], neural=target["neural"]):
+            # Profile, network and reverb switch instantly inside the running worker.
+            if await self._command(profile=target["mode"], neural=target["neural"], reverb=target["reverb"]):
                 self.live_mode = target["mode"]
                 self.live_neural = target["neural"]
-                self.live_status = {**self.live_status, "profile": target["mode"], "neural": target["neural"]}
+                self.live_reverb = target["reverb"]
+                self.live_status = {
+                    **self.live_status,
+                    "profile": target["mode"],
+                    "neural": target["neural"],
+                    "reverb": target["reverb"],
+                }
                 return
         process, self.live = self.live, None
         await self._stop(process)
-        await self._start_live(target["mode"], target["neural"])
+        await self._start_live(target["mode"], target["neural"], target["reverb"])
 
     async def _watch_live(self, process):
         async for line in process.stdout:
@@ -296,6 +309,14 @@ class Plugin:
             raise ValueError("Ожидалось true/false.")
         async with self.lock:
             self._edit_context(neural=enabled)
+            await self._apply()
+        return await self.get_status()
+
+    async def set_reverb(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError("Ожидалось true/false.")
+        async with self.lock:
+            self._edit_context(reverb=enabled)
             await self._apply()
         return await self.get_status()
 

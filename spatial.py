@@ -158,6 +158,8 @@ def load_speaker_correction(path, max_taps=16384):
     if rate != RATE:
         data = dsp.resample_poly(data, RATE, rate, axis=-1)
     energy = np.cumsum(np.sum(data ** 2, axis=0))
+    if energy[-1] <= 0:
+        raise ValueError(f"Empty speaker correction FIR: {path}")
     length = int(min(max_taps, np.searchsorted(energy, 0.999 * energy[-1]) + 1))
     length = max(length, 256)
     data = data[:, :length].copy()
@@ -168,7 +170,7 @@ def load_speaker_correction(path, max_taps=16384):
     band = (frequencies >= 150) & (frequencies <= 8000)
     pink = 1 / frequencies[band]
     gain = np.sum(spectrum[:, band] * pink, axis=-1) / np.sum(pink)
-    data /= np.sqrt(gain)[:, None]
+    data /= np.sqrt(np.maximum(gain, 1e-12))[:, None]
     data *= 10 ** (-2.0 / 20)  # its 150-500 Hz lift still reads ~2 dB louder (measured)
     return data[:, None, :].astype(np.float32)
 
@@ -236,7 +238,9 @@ class Dynamics:
             return
         weighted = self.k_high.process(block)
         weighted = weighted + 0.585 * self.k_shelf.process(weighted)  # ~+4 dB highs
-        self.mean_square = self.momentary * self.mean_square + (1 - self.momentary) * np.mean(weighted ** 2)
+        # ITU-R BS.1770 sums per-channel mean-square power for stereo LUFS.
+        power = float(np.sum(np.mean(weighted ** 2, axis=-1)))
+        self.mean_square = self.momentary * self.mean_square + (1 - self.momentary) * power
         loudness = -0.691 + 10 * np.log10(self.mean_square + 1e-12)
         if loudness <= self.SILENCE_LUFS:
             return  # hold: never pump up silence or room tone
@@ -318,15 +322,17 @@ class CrosstalkWidener:
 
 
 class Renderer:
-    def __init__(self, hrir_path, make_vocals=None, profile="game", neural=True):
+    def __init__(self, hrir_path, make_vocals=None, profile="game", neural=True, reverb=True):
         hrirs, self.positions = load_hrirs(hrir_path)
         self.direct = Convolver(hrirs)
         self.rooms = {name: room_response(values["rt60"], seed=7) for name, values in PROFILES.items()}
         self.room = Convolver(self.rooms[profile])
-        self.model = make_vocals() if make_vocals else None
-        latency = getattr(self.model, "latency", 1)
-        self.model_delay = Delay(8, latency * HOP)  # channels kept in step with the model
-        self.model_delay_stereo = Delay(2, latency * HOP)  # stands in for the model on silence
+        self._make_vocals = make_vocals
+        self.model = None
+        self.model_latency = 1
+        self.model_delay = Delay(8, self.model_latency * HOP)  # channels kept in step with the model
+        self.model_silence_blocks = self.model_latency + 2
+        self._last_dub_tick = -1
         self.voice_power = 0.0               # running statistics for dub-fix
         self.voice_xcorr = np.zeros(7)
         self.voice_decay = np.exp(-HOP / (RATE * 0.25))
@@ -340,6 +346,7 @@ class Renderer:
         self.bypass = False
         self.source = "stereo"
         self.neural = neural  # StemgenRT for stereo; otherwise a passive matrix
+        self.reverb = reverb  # synthetic room reverb (can be disabled for dry sound)
         # Speaker virtualiser state.
         self.device = "headphones"
         self.correction = None             # Convolver with the speaker FIR, or None
@@ -381,22 +388,33 @@ class Renderer:
 
     # -- speaker feeds ----------------------------------------------------
 
+    def _ensure_model(self):
+        if self.model is None and self._make_vocals is not None:
+            self.model = self._make_vocals()
+            self.model_latency = getattr(self.model, "latency", 1)
+            self.model_delay = Delay(8, self.model_latency * HOP)
+            self.model_silence_blocks = self.model_latency + 2
+        return self.model is not None
+
     def _model(self, audio):
         """(dry, rest) for a stereo pair, both delayed by the model latency.
 
-        Silence skips inference (saves a core and battery while nothing plays);
-        the pipelined model notices the gap and drops its stale result.
+        Drains the pipeline tail for `model_latency + 2` blocks when audio goes
+        silent, then pauses inference to save CPU and battery. On resume,
+        PipelinedVocals sees the tick gap and resets cleanly from zero.
         """
         if np.sqrt(np.mean(audio ** 2)) <= SILENCE:
-            dry = self.model_delay_stereo.process(np.asarray(audio, dtype=np.float32))
-            return dry, dry
+            self.model_silence_blocks += 1
+            if self.model_silence_blocks > self.model_latency + 2:
+                zeros = np.zeros((2, HOP), dtype=np.float32)
+                return zeros, zeros
+        else:
+            self.model_silence_blocks = 0
         audio = np.ascontiguousarray(audio, dtype=np.float32)
-        dry, rest = self.model.process(audio, self.tick)
-        self.model_delay_stereo.process(audio)  # keep the bypass delay line in step
-        return dry, rest
+        return self.model.process(audio, self.tick)
 
     def _surround_feeds(self, block):
-        if self.neural and self.model is not None and self.settings["dub_fix"]:
+        if self.neural and self.settings["dub_fix"] and self._ensure_model():
             return self._dub_fix_feeds(block)
         feeds = block[[FL, FR, FC, RL, RR, SL, SR]].copy()
         feeds[2] *= self.settings["dialogue"]
@@ -422,6 +440,9 @@ class Renderer:
         dry, rest = self._model(fold)
         # Dub voice is effectively mono: one reference keeps the fit well posed.
         voice = (dry - rest).mean(axis=0).astype(np.float64)
+        if self._last_dub_tick != self.tick - 1:
+            self.model_delay = Delay(8, self.model_latency * HOP)
+        self._last_dub_tick = self.tick
         late = self.model_delay.process(block)  # aligned with the model output
         channels = late[[FL, FR, FC, RL, RR, SL, SR]].astype(np.float64)
         decay = self.voice_decay
@@ -445,7 +466,7 @@ class Renderer:
 
     def _stereo_feeds(self, block):
         dry = block[[FL, FR]]
-        if self.neural and self.model is not None and self.settings.get("stereo_model", True):
+        if self.neural and self.settings.get("stereo_model", True) and self._ensure_model():
             dry, rest = self._model(dry)
             voice = dry - rest
         else:
@@ -472,11 +493,12 @@ class Renderer:
 
     def _render(self, feeds, lfe):
         ears = self.direct.process(feeds)
-        send = np.stack((
-            feeds[0] + 0.7 * feeds[2] + feeds[5] + feeds[3],
-            feeds[1] + 0.7 * feeds[2] + feeds[6] + feeds[4],
-        )) * 0.5
-        ears += self.room.process(send.astype(np.float32)) * self.settings["room"]
+        if self.reverb:
+            send = np.stack((
+                feeds[0] + 0.7 * feeds[2] + feeds[5] + feeds[3],
+                feeds[1] + 0.7 * feeds[2] + feeds[6] + feeds[4],
+            )) * 0.5
+            ears += self.room.process(send.astype(np.float32)) * self.settings["room"]
         if lfe is not None:
             b, a, state = self.lfe_filter
             low, state = dsp.lfilter(b, a, lfe, zi=state)
@@ -501,7 +523,8 @@ class Renderer:
         left = fl + voice + late + surround_side
         right = fr + voice + late - surround_side
         out = self.widener.process(np.stack((left, right)).astype(np.float32))
-        out += self.room.process(out * 0.5) * (self.settings["room"] * 0.5)
+        if self.reverb:
+            out += self.room.process(out * 0.5) * (self.settings["room"] * 0.5)
         if lfe is not None:
             out += self.speaker_lfe.process(lfe[None])[0] * 0.7
         if self.correction_enabled:
