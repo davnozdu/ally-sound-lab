@@ -11,27 +11,31 @@ USER_HOME = Path(decky.DECKY_USER_HOME)
 DATA_DIR = USER_HOME / ".local" / "share" / "ally-sound-npu"
 PYTHON = DATA_DIR / ".venv" / "bin" / "python"
 MODELS = ("vocals.onnx", "ku100.sofa")
+EQ_MODELS = ("yamnet/yamnet.onnx", "yamnet/yamnet.data", "yamnet/discogs-effnet-bsdynamic-1.onnx")
 SETTINGS = DATA_DIR / "settings.json"
 WORKER_LOG = DATA_DIR / "worker.log"
 PROFILES = {"game", "movie"}
 DEVICES = {"headphones", "speakers", "glasses"}
 LIVE_MODES = {"off"} | PROFILES
-DEFAULT = {"mode": "off", "neural": True, "reverb": True}
+DEFAULT = {"mode": "off", "neural": True, "reverb": True, "upmix": False, "auto_eq": False}
 RESTART_LIMIT = 5        # unexpected live-worker exits tolerated...
 RESTART_WINDOW = 120     # ...within this many seconds
 
 
 def clean_entry(entry, fallback):
-    mode = entry.get("mode", fallback["mode"]) if isinstance(entry, dict) else fallback["mode"]
+    entry = entry if isinstance(entry, dict) else {}
+    mode = entry.get("mode", fallback["mode"])
     # Modes from the first version ("hrtf", "stemgen") map onto profiles.
     mode = {"hrtf": "game", "stemgen": "movie"}.get(mode, mode)
-    neural = entry.get("neural", fallback["neural"]) if isinstance(entry, dict) else fallback["neural"]
-    reverb = entry.get("reverb", fallback["reverb"]) if isinstance(entry, dict) else fallback["reverb"]
-    return {
-        "mode": mode if mode in LIVE_MODES else fallback["mode"],
-        "neural": neural if isinstance(neural, bool) else fallback["neural"],
-        "reverb": reverb if isinstance(reverb, bool) else fallback["reverb"],
-    }
+    values = {"mode": mode if mode in LIVE_MODES else fallback["mode"]}
+    for key in ("neural", "reverb", "upmix", "auto_eq"):
+        value = entry.get(key)
+        values[key] = value if isinstance(value, bool) else fallback[key]
+    return values
+
+
+def has_models(names):
+    return all((DATA_DIR / "models" / name).is_file() for name in names)
 
 
 class Plugin:
@@ -46,6 +50,7 @@ class Plugin:
         self.bypass = False
         self.installer = None
         self.install_status = {}
+        self.eq_install_status = {}
         self.app = {"id": 0, "name": ""}
         self.restarts = []
         # Leftovers from the removed TIGER-DnR file renderer.
@@ -91,7 +96,7 @@ class Plugin:
     def _effective(self):
         entry = self._app_entry()
         source = entry or self.settings["default"]
-        return {"mode": source["mode"], "neural": source["neural"], "reverb": source["reverb"]}
+        return {key: source[key] for key in DEFAULT}
 
     def _edit_context(self, **changes):
         """Apply changes to the running app's own entry, or to the default."""
@@ -109,11 +114,14 @@ class Plugin:
     async def get_status(self):
         effective = self._effective()
         return {
-            "installed": PYTHON.is_file() and all((DATA_DIR / "models" / name).is_file() for name in MODELS),
+            "installed": PYTHON.is_file() and has_models(MODELS),
             "mode": self.live_mode,
             "wanted": effective["mode"],
             "neural": effective["neural"],
             "reverb": effective["reverb"],
+            "upmix": effective["upmix"],
+            "auto_eq": effective["auto_eq"],
+            "eq_ready": has_models(EQ_MODELS),
             "bypass": self.bypass,
             "app": self.app,
             "custom": self._app_entry() is not None,
@@ -121,6 +129,7 @@ class Plugin:
             "devices": self.settings["devices"],
             "live": self.live_status,
             "install": self.install_status,
+            "eq_install": self.eq_install_status,
         }
 
     # -- processes --------------------------------------------------------
@@ -184,7 +193,7 @@ class Plugin:
             return False
         return True
 
-    async def _start_live(self, mode, neural, reverb):
+    async def _start_live(self, mode, neural, reverb, upmix, auto_eq):
         """Start the live worker. Caller holds self.lock."""
         if not PYTHON.is_file():
             raise RuntimeError("Модели ещё не установлены.")
@@ -193,6 +202,10 @@ class Plugin:
             args.append("--no-neural")
         if not reverb:
             args.append("--no-reverb")
+        if upmix:
+            args.append("--upmix")
+        if auto_eq:
+            args.append("--auto-eq")
         self.live_status = {"phase": "starting"}
         self.live = await self._spawn(*args)
         self.live_mode = mode
@@ -206,6 +219,7 @@ class Plugin:
     async def _apply(self):
         """Bring the worker in line with the effective settings. Caller holds self.lock."""
         target = self._effective()
+        target["auto_eq"] = target["auto_eq"] and has_models(EQ_MODELS)
         if target["mode"] == "off":
             process, self.live = self.live, None
             await self._stop(process)
@@ -214,8 +228,10 @@ class Plugin:
             self.bypass = False
             return
         if self.live is not None and self.live_mode in PROFILES:
-            # Profile, network and reverb switch instantly inside the running worker.
-            if await self._command(profile=target["mode"], neural=target["neural"], reverb=target["reverb"]):
+            if await self._command(
+                profile=target["mode"], neural=target["neural"], reverb=target["reverb"],
+                upmix=target["upmix"], auto_eq=target["auto_eq"],
+            ):
                 self.live_mode = target["mode"]
                 self.live_neural = target["neural"]
                 self.live_reverb = target["reverb"]
@@ -224,11 +240,13 @@ class Plugin:
                     "profile": target["mode"],
                     "neural": target["neural"],
                     "reverb": target["reverb"],
+                    "upmix": target["upmix"],
+                    "auto_eq": target["auto_eq"],
                 }
                 return
         process, self.live = self.live, None
         await self._stop(process)
-        await self._start_live(target["mode"], target["neural"], target["reverb"])
+        await self._start_live(**target)
 
     async def _watch_live(self, process):
         async for line in process.stdout:
@@ -320,6 +338,29 @@ class Plugin:
             await self._apply()
         return await self.get_status()
 
+    async def set_upmix(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError("Ожидалось true/false.")
+        async with self.lock:
+            self._edit_context(upmix=enabled)
+            await self._apply()
+        return await self.get_status()
+
+    async def set_auto_eq(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError("Ожидалось true/false.")
+        async with self.lock:
+            if enabled and not has_models(EQ_MODELS):
+                if not PYTHON.is_file():
+                    raise RuntimeError("Сначала установите основные компоненты.")
+                if self.installer is None or self.installer.returncode is not None:
+                    await self._start_installer(auto_eq=True)
+                elif self.eq_install_status.get("phase") != "running":
+                    raise RuntimeError("Дождитесь установки основных компонентов.")
+            self._edit_context(auto_eq=enabled)
+            await self._apply()
+        return await self.get_status()
+
     async def reset_app(self):
         """Forget the running app's own settings; it follows the default again."""
         async with self.lock:
@@ -347,41 +388,47 @@ class Plugin:
     async def install_runtime(self):
         """Download uv (if missing), Python 3.13, libraries and models."""
         async with self.lock:
-            if self.installer is not None and self.installer.returncode is None:
-                raise RuntimeError("Установка уже идёт.")
-            script = PLUGIN_DIR / "install-runtime.sh"
-            if not script.is_file():
-                raise RuntimeError("В плагине нет install-runtime.sh.")
-            self.install_status = {"phase": "running", "step": "Запуск"}
-            self.installer = await self._spawn("/bin/bash", script)
-            self._watch(self._watch_installer(self.installer))
+            await self._start_installer()
         return await self.get_status()
 
-    async def _watch_installer(self, process):
+    async def _start_installer(self, auto_eq=False):
+        if self.installer is not None and self.installer.returncode is None:
+            raise RuntimeError("Установка уже идёт.")
+        script = PLUGIN_DIR / "install-runtime.sh"
+        if not script.is_file():
+            raise RuntimeError("В плагине нет install-runtime.sh.")
+        args = ("--auto-eq",) if auto_eq else ()
+        self.installer = await self._spawn("/bin/bash", script, *args)
+        status = self.eq_install_status if auto_eq else self.install_status
+        status.clear()
+        status.update(phase="running", step="Запуск")
+        self._watch(self._watch_installer(self.installer, auto_eq, status))
+
+    async def _watch_installer(self, process, auto_eq, status):
         last = ""
         async for raw in process.stdout:
             line = raw.decode(errors="replace").strip()
             if line.startswith("## "):
                 last = line[3:]
-                self.install_status = {"phase": "running", "step": last}
+                status.update(phase="running", step=last)
         code = await process.wait()
-        if self.installer is not process:
-            return
-        self.installer = None
-        status = await self.get_status()
-        if code == 0 and status["installed"]:
-            self.install_status = {"phase": "done"}
-            decky.logger.info("Runtime installed")
-            async with self.lock:
-                if self.live is None and self._effective()["mode"] != "off":
+        async with self.lock:
+            if self.installer is not process:
+                return
+            self.installer = None
+            status.clear()
+            if code == 0 and has_models(EQ_MODELS if auto_eq else MODELS) and PYTHON.is_file():
+                status.update(phase="done")
+                decky.logger.info("%s installed", "YAMNet" if auto_eq else "Runtime")
+                if (auto_eq or self.live is None) and self._effective()["mode"] != "off":
                     try:
                         await self._apply()
                     except Exception as exc:
                         self.live_status = {"error": str(exc)}
-        else:
-            reason = last if last.startswith("Ошибка") else f"код {code}, шаг «{last}»"
-            self.install_status = {"phase": "error", "error": f"Установка не удалась ({reason}). Подробности в worker.log."}
-            decky.logger.error("Runtime install failed: %s", reason)
+            else:
+                reason = last if last.startswith("Ошибка") else f"код {code}, шаг «{last}»"
+                status.update(phase="error", error=f"Установка не удалась ({reason}). Подробности в worker.log.")
+                decky.logger.error("Installation failed: %s", reason)
 
     async def set_bypass(self, enabled):
         if not isinstance(enabled, bool):

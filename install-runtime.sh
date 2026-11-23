@@ -15,6 +15,60 @@ check() {  # check SHA256 FILE
     echo "$1  $2" | sha256sum -c --status -
 }
 
+install_yamnet() (
+    local dest="models/yamnet"
+    local graph_sum=970ea63f4dc1aa33c86ef7d61d854319fdfe6bdd078f5b3d674ee1db5dd96471
+    local data_sum=1d6dff488da4712190e10f1c841252aa58011381132d0126dcd5ee56a4e7ed31
+    if [ -f "$dest/yamnet.onnx" ] && [ -f "$dest/yamnet.data" ] &&
+        check "$graph_sum" "$dest/yamnet.onnx" && check "$data_sum" "$dest/yamnet.data"; then
+        echo "## YAMNet готова"
+        return
+    fi
+    echo "## Скачивание модели YAMNet"
+    local temporary
+    temporary=$(mktemp -d models/.yamnet.XXXXXX)
+    trap 'rm -rf -- "$temporary"' EXIT
+    curl -fL --retry 2 -o "$temporary/model.zip" \
+        https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/yamnet/releases/v0.59.0/yamnet-onnx-float.zip
+    check bda628207418bc59b6a371aef6180b53367707eaf7b8b8a7c683417000d1eea4 "$temporary/model.zip" ||
+        { echo "## Ошибка: контрольная сумма YAMNet не совпала"; exit 1; }
+    .venv/bin/python - "$temporary" <<'PY'
+from pathlib import Path
+import sys
+from zipfile import ZipFile
+
+target = Path(sys.argv[1])
+with ZipFile(target / "model.zip") as archive:
+    for name in ("yamnet.onnx", "yamnet.data"):
+        (target / name).write_bytes(archive.read("yamnet-onnx-float/" + name))
+PY
+    check "$graph_sum" "$temporary/yamnet.onnx" && check "$data_sum" "$temporary/yamnet.data" ||
+        { echo "## Ошибка: файлы модели YAMNet повреждены"; exit 1; }
+    mkdir -p "$dest"
+    mv -f "$temporary/yamnet.data" "$temporary/yamnet.onnx" "$dest/"
+    echo "## YAMNet готова"
+)
+
+if [ "${1:-}" = "--auto-eq" ]; then
+    install_yamnet
+    # Discogs-EffNet (Essentia, 400 Discogs styles) replaced MSD-MusiCNN for the genre.
+    rm -f models/yamnet/msd-musicnn-1.onnx
+    genre="models/yamnet/discogs-effnet-bsdynamic-1.onnx"
+    genre_sum=a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c
+    if [ ! -f "$genre" ] || ! check "$genre_sum" "$genre"; then
+        echo "## Скачивание модели Discogs-EffNet"
+        temporary=$(mktemp models/.effnet.XXXXXX)
+        trap 'rm -f -- "$temporary"' EXIT
+        curl -fL --retry 2 -o "$temporary" \
+            https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bsdynamic-1.onnx
+        check "$genre_sum" "$temporary" ||
+            { echo "## Ошибка: контрольная сумма Discogs-EffNet не совпала"; exit 1; }
+        mv -f "$temporary" "$genre"
+    fi
+    echo "## Модели автоэквалайзера готовы"
+    exit 0
+fi
+
 echo "## 1/4 Инструмент установки (uv)"
 # ASL_UV="" forces the pinned download (used to test a clean machine).
 UV=${ASL_UV-$(command -v uv || true)}

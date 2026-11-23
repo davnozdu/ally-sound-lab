@@ -10,6 +10,7 @@ ambience of the remaining mix is spread to the sides and rear.
 
 import h5py
 import numpy as np
+from scipy import fft
 from scipy import signal as dsp
 
 RATE = 44100
@@ -49,6 +50,7 @@ SURROUND_TRIM = 10 ** (-3.7 / 20)
 # Stereo is matched to the untouched input (bypass passes it through as is);
 # the render was measured 4.4 dB below that.
 STEREO_TRIM = 10 ** (4.4 / 20)
+UPMIX_MAKEUP = np.float32(10 ** (2.4 / 20))
 # Output devices. Headphones get full binaural HRTF. Open speakers mix both
 # channels in the air, so binaural cues are lost: "speakers" uses a widening
 # virtualiser instead. Glasses (XREAL) have open speakers right at the ears,
@@ -196,6 +198,54 @@ class Delay:
         self.buffer = joined[:, block.shape[-1]:]
         return joined[:, :block.shape[-1]]
 
+    def reset(self):
+        self.buffer.fill(0)
+
+
+class CoherenceUpmix:
+    """Split each frequency bin into front L/R, centre and ambience L/R."""
+
+    SIZE = 4 * HOP
+    DELAY = SIZE - HOP
+
+    def __init__(self):
+        self.window = np.sqrt(np.hanning(self.SIZE + 1)[:-1]).astype(np.float32)
+        self.synthesis = self.window * 0.5  # sqrt-Hann at 75% overlap
+        self.alpha = np.float32(np.exp(-HOP / (RATE * 0.06)))
+        bins = self.SIZE // 2 + 1
+        self.history = np.zeros((2, self.SIZE), dtype=np.float32)
+        self.overlap = np.zeros((5, self.SIZE), dtype=np.float32)
+        self.power = np.zeros((2, bins), dtype=np.float32)
+        self.cross = np.zeros(bins, dtype=np.complex64)
+
+    def reset(self):
+        for buffer in (self.history, self.overlap, self.power, self.cross):
+            buffer.fill(0)
+
+    def process(self, stereo):
+        self.history[:, :-HOP] = self.history[:, HOP:]
+        self.history[:, -HOP:] = stereo
+        spectrum = fft.rfft(self.history * self.window, axis=-1)
+        weight = np.float32(1) - self.alpha
+        self.power *= self.alpha
+        self.power += weight * (spectrum.real ** 2 + spectrum.imag ** 2)
+        self.cross *= self.alpha
+        self.cross += weight * spectrum[0] * spectrum[1].conj()
+
+        left, right = self.power
+        coherence = np.minimum(1, np.abs(self.cross) / np.sqrt(left * right + 1e-24))
+        # Panned energy stays in front. Balanced, decorrelated energy goes to ambience.
+        balance = 1 - np.abs(left - right) / (left + right + 1e-24)
+        ambient = spectrum * ((1 - coherence) * balance)
+        direct = spectrum - ambient
+        centre = 0.5 * balance ** 2 * (direct[0] + direct[1])
+        channels = np.stack((direct[0] - centre, direct[1] - centre, centre, ambient[0], ambient[1]))
+        self.overlap += fft.irfft(channels, n=self.SIZE, axis=-1) * self.synthesis
+        result = self.overlap[:, :HOP].copy()
+        self.overlap[:, :-HOP] = self.overlap[:, HOP:]
+        self.overlap[:, -HOP:] = 0
+        return result
+
 
 class Dynamics:
     """Leveler -> fast compressor -> look-ahead limiter.
@@ -322,7 +372,9 @@ class CrosstalkWidener:
 
 
 class Renderer:
-    def __init__(self, hrir_path, make_vocals=None, profile="game", neural=True, reverb=True):
+    def __init__(
+        self, hrir_path, make_vocals=None, profile="game", neural=True, reverb=True, upmix=False, auto_eq=None,
+    ):
         hrirs, self.positions = load_hrirs(hrir_path)
         self.direct = Convolver(hrirs)
         self.rooms = {name: room_response(values["rt60"], seed=7) for name, values in PROFILES.items()}
@@ -338,6 +390,12 @@ class Renderer:
         self.voice_decay = np.exp(-HOP / (RATE * 0.25))
         self.tick = 0
         self.ambience_delay = Delay(2, int(AMBIENCE_DELAY * RATE))
+        self.upmix = upmix
+        self.auto_eq = auto_eq
+        self.coherence = CoherenceUpmix()
+        self.upmix_dialogue_delay = Delay(2, CoherenceUpmix.DELAY)
+        self._last_upmix_tick = -1
+        self._upmix_neural = False
         self.dynamics = Dynamics()
         lfe_b, lfe_a = dsp.butter(2, 120 / (RATE / 2))
         self.lfe_filter = (lfe_b, lfe_a, np.zeros(2))
@@ -467,11 +525,41 @@ class Renderer:
             clean[5:7], clean[3:5] = clean[3:5], 0.0
         return clean, late[LFE]
 
+    def _coherence_feeds(self, dry, sep_rest):
+        neural = sep_rest is not None
+        if self._last_upmix_tick != self.tick - 1 or neural != self._upmix_neural:
+            self.coherence.reset()
+            self.upmix_dialogue_delay.reset()
+        self._last_upmix_tick = self.tick
+        self._upmix_neural = neural
+
+        lfe = None
+        if neural:
+            voice = (dry - sep_rest) * 0.75
+            dry = dry - voice
+            aligned = self.upmix_dialogue_delay.process(
+                np.stack((voice.mean(axis=0), sep_rest.mean(axis=0) * 0.25))
+            )
+            voice_centre, lfe = aligned
+
+        bands = self.coherence.process(dry) * UPMIX_MAKEUP
+        if neural:
+            bands[2] += voice_centre
+        bands[2] *= self.settings["dialogue"]
+        ambience = bands[3:]
+        rear = self.ambience_delay.process(ambience)
+        feeds = np.concatenate((bands[:3], rear * 0.40, ambience * 0.45))
+        return feeds, lfe
+
     def _stereo_feeds(self, block):
         dry = block[[FL, FR]]
         lfe = None
-        if self.neural and self.settings.get("stereo_model", True) and self._ensure_model():
+        neural = self.neural and self.settings["stereo_model"] and self._ensure_model()
+        if neural:
             dry, sep_rest = self._model(dry)
+        if self.upmix:
+            return self._coherence_feeds(dry, sep_rest if neural else None)
+        if neural:
             # Move 75% of the separated voice to the centre and keep 25% in
             # L/R so dialogue stays natural and blended instead of pushy.
             voice = (dry - sep_rest) * 0.75
@@ -568,6 +656,8 @@ class Renderer:
         """block: float32 (8, HOP). Returns float32 (2, HOP)."""
         self.tick += 1
         self.source = self._detect(block)
+        if self.auto_eq is not None and self.auto_eq.enabled:
+            self.auto_eq.observe(self._downmix(block))
         if self.bypass:
             # A/B compares the spatial part only: same dynamics on both sides.
             out = self._downmix(block)
@@ -581,6 +671,8 @@ class Renderer:
             else:
                 trim = SURROUND_TRIM if self.source == "surround" else STEREO_TRIM
             out = self._render_device(feeds, lfe) * trim
+            if self.auto_eq is not None:
+                out = self.auto_eq.apply(out)
         # Films everywhere, and small open speakers always, get the leveler
         # and compressor; games on headphones keep their full dynamics.
         dynamic = self.settings["compress"] or self.device != "headphones"

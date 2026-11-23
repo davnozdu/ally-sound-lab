@@ -15,6 +15,7 @@ from time import monotonic, perf_counter
 import numpy as np
 import onnxruntime as ort
 
+from auto_eq import AutoEqualizer
 from spatial import CHANNELS, DEVICES, HOP, PROFILES, RATE, Delay, Renderer
 
 SINK = "ally_sound_lab"
@@ -309,11 +310,11 @@ def recover_route():
     ROUTE_STATE.unlink(missing_ok=True)
 
 
-def run_live(profile, neural, reverb=True):
+def run_live(profile, neural, reverb=True, upmix=False, auto_eq=False):
     with (RUNTIME_DIR / "live.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         recover_route()
-        process_live(profile, neural, reverb)
+        process_live(profile, neural, reverb, upmix, auto_eq)
 
 
 SURROUND_MAP = ",".join(CHANNELS)
@@ -402,7 +403,7 @@ def read_commands(pending, pending_lock):
         with pending_lock:
             if command.get("profile") in PROFILES:
                 pending["profile"] = command["profile"]
-            for flag in ("bypass", "neural", "reverb"):
+            for flag in ("bypass", "neural", "reverb", "upmix", "auto_eq"):
                 if isinstance(command.get(flag), bool):
                     pending[flag] = command[flag]
             if isinstance(command.get("devices"), dict):
@@ -411,11 +412,13 @@ def read_commands(pending, pending_lock):
                 }
 
 
-def process_live(profile, neural, reverb=True):
+def process_live(profile, neural, reverb=True, upmix=False, auto_eq=False):
     realtime = realtime_priority()  # threads started below inherit it
+    equalizer = AutoEqualizer(MODELS / "yamnet" / "yamnet.onnx", RATE, HOP)
+    equalizer.set_enabled(auto_eq)
     renderer = Renderer(
         MODELS / "ku100.sofa", make_vocals=lambda: PipelinedVocals(Vocals()),
-        profile=profile, neural=neural, reverb=reverb,
+        profile=profile, neural=neural, reverb=reverb, upmix=upmix, auto_eq=equalizer,
     )
     pending = {}
     pending_lock = Lock()
@@ -558,6 +561,10 @@ def process_live(profile, neural, reverb=True):
                     renderer.neural = updates["neural"]
                 if "reverb" in updates:
                     renderer.reverb = updates["reverb"]
+                if "upmix" in updates:
+                    renderer.upmix = updates["upmix"]
+                if "auto_eq" in updates:
+                    equalizer.set_enabled(updates["auto_eq"])
                 if "overrides" in updates:
                     overrides.clear()
                     overrides.update(updates["overrides"])
@@ -607,6 +614,10 @@ def process_live(profile, neural, reverb=True):
                     bypass=renderer.bypass,
                     neural=renderer.neural,
                     reverb=renderer.reverb,
+                    upmix=renderer.upmix,
+                    auto_eq=equalizer.enabled,
+                    eq_profile=equalizer.profile,
+                    eq_error=equalizer.error,
                     realtime=realtime,
                 )
                 window_blocks = 0
@@ -629,11 +640,13 @@ def main():
     live.add_argument("profile", choices=tuple(PROFILES))
     live.add_argument("--no-neural", dest="neural", action="store_false")
     live.add_argument("--no-reverb", dest="reverb", action="store_false")
+    live.add_argument("--upmix", action="store_true", help="use per-frequency upmix for stereo")
+    live.add_argument("--auto-eq", action="store_true", help="adapt EQ using the installed YAMNet model")
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
-        run_live(args.profile, args.neural, args.reverb)
+        run_live(args.profile, args.neural, args.reverb, args.upmix, args.auto_eq)
     except KeyboardInterrupt:
         pass
     except Exception as exc:

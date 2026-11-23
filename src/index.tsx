@@ -5,6 +5,7 @@ import { FaHeadphones } from "react-icons/fa";
 
 type Mode = "off" | "game" | "movie";
 type Device = "headphones" | "speakers" | "glasses";
+type InstallStatus = { phase?: "running" | "done" | "error"; step?: string; error?: string };
 
 interface Status {
   installed: boolean;
@@ -12,12 +13,16 @@ interface Status {
   wanted: Mode;
   neural: boolean;
   reverb: boolean;
+  upmix: boolean;
+  auto_eq: boolean;
+  eq_ready: boolean;
   bypass: boolean;
   app: { id: number; name: string };
   custom: boolean;
-  default: { mode: Mode; neural: boolean; reverb: boolean };
+  default: { mode: Mode; neural: boolean; reverb: boolean; upmix: boolean; auto_eq: boolean };
   devices: Record<string, Device>;
-  install: { phase?: "running" | "done" | "error"; step?: string; error?: string };
+  install: InstallStatus;
+  eq_install: InstallStatus;
   live: {
     phase?: string;
     output?: string;
@@ -29,6 +34,8 @@ interface Status {
     device?: Device;
     device_auto?: Device;
     correction?: boolean;
+    eq_profile?: string;
+    eq_error?: string | null;
   };
 }
 
@@ -37,6 +44,8 @@ const setLive = callable<[Mode], Status>("set_live");
 const setBypass = callable<[boolean], Status>("set_bypass");
 const setNeural = callable<[boolean], Status>("set_neural");
 const setReverb = callable<[boolean], Status>("set_reverb");
+const setUpmix = callable<[boolean], Status>("set_upmix");
+const setAutoEq = callable<[boolean], Status>("set_auto_eq");
 const resetApp = callable<[], Status>("reset_app");
 const setDeviceKind = callable<[Device | "auto"], Status>("set_device_kind");
 const installRuntime = callable<[], Status>("install_runtime");
@@ -63,6 +72,10 @@ function syncForegroundApp() {
 }
 
 const labels: Record<Mode, string> = { off: "Выключено", game: "Игра", movie: "Кино" };
+const eqLabels: Record<string, string> = {
+  neutral: "Нейтрально", speech: "Речь", music: "Музыка", metal: "Метал", rock: "Рок",
+  jazz: "Джаз", classical: "Классика", electronic: "Электроника", hiphop: "Хип-хоп",
+};
 
 const BUDGET_MS = (128 / 44100) * 1000;
 
@@ -137,6 +150,17 @@ function Content() {
     { data: "movie", label: labels.movie },
   ];
   const load = live?.avg_ms !== undefined ? Math.round((live.avg_ms / BUDGET_MS) * 100) : undefined;
+  let eqDescription = "Мягко подстраивает звучание под речь и музыку.";
+  if (status?.auto_eq) {
+    if (status.eq_install?.phase === "running") eqDescription = status.eq_install.step ?? "Скачивание модели";
+    else if (status.eq_install?.error && !status.eq_ready) eqDescription = status.eq_install.error;
+    else if (!status.eq_ready) eqDescription = "Для включения нужно скачать модель YAMNet.";
+    else if (live?.eq_error) eqDescription = "Модель не запустилась. Подробности в worker.log.";
+    else if (live?.eq_profile) eqDescription = eqLabels[live.eq_profile] ?? "Нейтрально";
+    if (status.bypass) eqDescription = "Приостановлен для сравнения с оригиналом.";
+  } else if (!status?.eq_ready) {
+    eqDescription += " При первом включении скачает модели (около 17 МБ).";
+  }
 
   return (
     <PanelSection title="Объёмный звук">
@@ -171,11 +195,33 @@ function Content() {
             description={
               status?.neural
                 ? "StemgenRT отделяет голос в стерео и собирает дубляж 5.1/7.1 в центр."
-                : "Простая матрица без нейросети: меньше нагрузка на CPU, голос отделяется грубее."
+                : "Выделение диалога по стереосигналу. Нагрузка на CPU ниже."
             }
             checked={!!status?.neural}
             disabled={busy}
             onChange={(enabled) => void run(() => setNeural(enabled))}
+          />
+        </PanelSectionRow>
+      )}
+      {selected !== "off" && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Точный апмикс 7.1"
+            description="Распределяет стереозвук по виртуальным каналам отдельно по частотам."
+            checked={!!status?.upmix}
+            disabled={busy || !status?.installed}
+            onChange={(enabled) => void run(() => setUpmix(enabled))}
+          />
+        </PanelSectionRow>
+      )}
+      {selected !== "off" && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Автоэквалайзер"
+            description={eqDescription}
+            checked={!!status?.auto_eq}
+            disabled={busy || !status?.installed}
+            onChange={(enabled) => void run(() => setAutoEq(enabled))}
           />
         </PanelSectionRow>
       )}
