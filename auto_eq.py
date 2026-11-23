@@ -38,9 +38,12 @@ GENRE_PATCHES = 3
 GENRE_PATCH_FRAMES = 128
 GENRE_PATCH_HOP = 56
 
-# Battery: classify in short probes. Once the result is stable (and, for music, its
-# genre has been checked) the classifier rests this many windows (~20 s).
+# Speech/music (YAMNet) runs every window (~1 s): films and games change between
+# dialogue, music and effects within seconds. The genre only matters for the music
+# profile and changes with the track: after a check it is reused for REST_WINDOWS
+# music windows (~20 s); a check gives up after MAX_GENRE_PASSES unsure passes.
 REST_WINDOWS = 20
+MAX_GENRE_PASSES = 4
 # Release the ONNX sessions after this much silence.
 IDLE_RELEASE_SECONDS = 10.0
 
@@ -179,7 +182,7 @@ class AutoEqualizer:
         self._thread = None
         self._samples = np.empty(math.ceil(PATCH_SAMPLES * rate / MODEL_RATE), dtype=np.float32)
         self._offset = 0
-        self._rest = 0           # windows to skip before the next probe (set by the worker)
+        self._genre = False      # music profile: refine music by genre
         self._release = False    # drop the models at the next worker wake-up
 
         # Parallel filtered corrections keep the signal path at unity when neutral.
@@ -210,13 +213,16 @@ class AutoEqualizer:
         self._generation += 1
         self.enabled = enabled
         self._offset = 0
-        self._rest = 0
         if enabled and self._thread is None:
             self._thread = Thread(target=self._run, name="Ally Auto EQ", daemon=True)
             self._thread.start()
         elif not enabled:
             # Switched off: give the model memory back.
             self._release = True
+
+    def set_genre(self, enabled):
+        """Music profile: refine music by genre. Elsewhere: speech vs music only."""
+        self._genre = enabled
 
     def observe(self, stereo):
         if not self.enabled or self.error is not None:
@@ -226,13 +232,10 @@ class AutoEqualizer:
         self._samples[self._offset:self._offset + take] = mono[:take]
         self._offset += take
         if self._offset == len(self._samples):
-            if self._rest > 0:
-                self._rest -= 1        # resting between probes: drop the window
-            else:
-                try:
-                    self._jobs.put_nowait((self._generation, self._samples.copy()))
-                except Full:
-                    pass  # playback takes priority over an outstanding classification
+            try:
+                self._jobs.put_nowait((self._generation, self._samples.copy()))
+            except Full:
+                pass  # playback takes priority over an outstanding classification
             self._samples[:len(mono) - take] = mono[take:]
             self._offset = len(mono) - take
 
@@ -247,9 +250,17 @@ class AutoEqualizer:
         recent_music = deque(maxlen=4)
         generation = -1
         vote, count = "neutral", 0
-        group_sum, group_runs, genre_ran = np.zeros(len(GROUP_PROFILES), np.float32), 0, False
+        known_genre, genre_rest, genre_passes = None, 0, 0
+        group_sum = np.zeros(len(GROUP_PROFILES), np.float32)
         silent = 0
         idle_windows = int(IDLE_RELEASE_SECONDS * self._rate / len(self._samples)) + 1
+
+        def restart_genre():
+            nonlocal genre_passes
+            recent_music.clear()
+            genre_passes = 0
+            group_sum[:] = 0
+
         while True:
             try:
                 job = self._jobs.get(timeout=IDLE_RELEASE_SECONDS)
@@ -258,7 +269,7 @@ class AutoEqualizer:
             if job is None or self._release:
                 self._release = False
                 model = genre_model = None
-                recent_music.clear()
+                restart_genre()
                 if job is None:
                     continue
             token, audio = job
@@ -267,56 +278,66 @@ class AutoEqualizer:
             if generation != token:
                 generation = token
                 vote, count = "neutral", 0
-                recent_music.clear()
-                group_sum[:], group_runs, genre_ran = 0, 0, False
+                known_genre, genre_rest = None, 0
+                restart_genre()
             rms = float(np.sqrt(np.mean(audio ** 2)))
             audible = np.isfinite(rms) and rms >= 1e-3
             silent = 0 if audible else silent + 1
             if not audible and silent >= idle_windows:
                 model = genre_model = None
-            candidate = "neutral"
+            candidate, pending = "neutral", False
             try:
+                mono = None
                 if audible:
                     if model is None:
                         model = Yamnet(self._model, self._rate)
                     mono = model.resample(audio)
                     candidate = model.classify(mono)
-                    if candidate == "music" or candidate in GENRES:
-                        recent_music.append(mono)
-                        if len(recent_music) == recent_music.maxlen:
-                            if genre_model is None:
-                                genre_model = DiscogsEffNet(
-                                    self._model.with_name("discogs-effnet-bsdynamic-1.onnx"))
-                            group_sum += genre_model.groups(np.concatenate(recent_music))
-                            group_runs += 1
-                            genre_ran = True
-                            candidate = genre_profile(group_sum / group_runs, candidate)
-                    else:
-                        recent_music.clear()
+                musical = candidate == "music" or candidate in GENRES
+                if not musical:
+                    restart_genre()
+                elif not self._genre:
+                    candidate = "music"            # films, games: speech vs music only
+                elif genre_rest > 0:
+                    genre_rest -= 1
+                    candidate = known_genre or "music"
                 else:
-                    recent_music.clear()
+                    recent_music.append(mono)
+                    if len(recent_music) < recent_music.maxlen:
+                        pending = known_genre is None
+                        candidate = known_genre or "music"
+                    else:
+                        if genre_model is None:
+                            genre_model = DiscogsEffNet(
+                                self._model.with_name("discogs-effnet-bsdynamic-1.onnx"))
+                        group_sum += genre_model.groups(np.concatenate(recent_music))
+                        genre_passes += 1
+                        # Averaged over this check: one ambiguous window cannot flip it.
+                        genre = genre_profile(group_sum / genre_passes, "music")
+                        if genre != "music":
+                            known_genre = genre
+                        # Confident, or unsure after MAX_GENRE_PASSES: rest until the
+                        # next check; an unsure check keeps the earlier genre.
+                        if genre != "music" or genre_passes >= MAX_GENRE_PASSES:
+                            genre_rest = REST_WINDOWS
+                            restart_genre()
+                        else:
+                            pending = known_genre is None
+                        candidate = known_genre or "music"
             except Exception as exc:
                 # A model or runtime failure leaves playback on the neutral curve.
                 print(f"Auto EQ: {exc}", file=sys.stderr, flush=True)
                 self._result = (token, "neutral", str(exc))
                 continue
-            if token != self._generation:
-                continue
+            if token != self._generation or pending:
+                continue                   # the first genre check keeps the previous curve
+            # Two agreeing windows (~2 s) move the curve; the gains then glide ~0.65 s.
             if candidate == vote:
                 count += 1
             else:
                 vote, count = candidate, 1
-            musical = candidate == "music" or candidate in GENRES
-            # Music only counts once its genre has been checked in this probe.
-            if count >= 2 and (not musical or genre_ran):
-                # An unsure probe keeps the genre an earlier probe found.
-                previous = self.profile
-                if not (candidate == "music" and previous in GENRES):
-                    self._result = (token, candidate, None)
-                self._rest = REST_WINDOWS
-                recent_music.clear()       # the next probe needs fresh, contiguous audio
-                group_sum[:], group_runs, genre_ran = 0, 0, False
-                count = 0
+            if count >= 2:
+                self._result = (token, candidate, None)
 
     def apply(self, stereo):
         profile = self.profile

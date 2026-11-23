@@ -33,12 +33,17 @@ PROFILES = {
     # audible as crackle -- while stealing a core from the game. Games get the
     # passive matrix; the network stays for films, which are not interactive.
     "game": {"dialogue": 1.0, "room": 0.10, "rt60": 0.22, "compress": False,
-             "dub_fix": False, "stereo_model": False},
+             "dub_fix": False, "stereo_model": False, "side_gain": 0.45, "rear_gain": 0.40},
     # Clear dialogue over effects, bigger room, tamed loud scenes. In 5.1/7.1
     # the network gathers voice from every channel into the centre, which
     # repairs dubs that were smeared over all speakers.
     "movie": {"dialogue": 10 ** (2.0 / 20), "room": 0.16, "rt60": 0.40, "compress": True,
-              "dub_fix": True, "stereo_model": True},
+              "dub_fix": True, "stereo_model": True, "side_gain": 0.45, "rear_gain": 0.40},
+    # Wide stage without pushing anything: no dialogue lift, a small room and
+    # quieter sides/rears than games, untouched dynamics (same as the phone module).
+    # Auto EQ refines music by genre only in this profile.
+    "music": {"dialogue": 1.0, "room": 0.08, "rt60": 0.25, "compress": False,
+              "dub_fix": False, "stereo_model": False, "side_gain": 0.38, "rear_gain": 0.32},
 }
 ROOM_SECONDS = 0.45
 SILENCE = 1e-5          # RMS below this counts as an unused channel (-100 dBFS)
@@ -435,6 +440,8 @@ class Renderer:
         self.profile = profile
         self.settings = PROFILES[profile]
         self.room.set_responses(self.rooms[profile])
+        if self.auto_eq is not None:
+            self.auto_eq.set_genre(profile == "music")
 
     # -- source analysis ------------------------------------------------
 
@@ -548,7 +555,7 @@ class Renderer:
         bands[2] *= self.settings["dialogue"]
         ambience = bands[3:]
         rear = self.ambience_delay.process(ambience)
-        feeds = np.concatenate((bands[:3], rear * 0.40, ambience * 0.45))
+        feeds = np.concatenate((bands[:3], rear * self.settings["rear_gain"], ambience * self.settings["side_gain"]))
         return feeds, lfe
 
     def _stereo_feeds(self, block):
@@ -577,7 +584,7 @@ class Renderer:
             voice = np.stack((0.5 * mid, 0.5 * mid))
             rest = dry - voice
             amb_src = rest
-            side_gain, rear_gain = 0.45, 0.40
+            side_gain, rear_gain = self.settings["side_gain"], self.settings["rear_gain"]
         # Ambience = what is not shared by both channels of the remaining mix.
         ambience = np.stack((amb_src[0] - 0.7 * amb_src[1], amb_src[1] - 0.7 * amb_src[0]))
         rear = self.ambience_delay.process(ambience)

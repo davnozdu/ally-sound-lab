@@ -1,6 +1,6 @@
 """Render a file through the live chain block by block, for listening tests.
 
-usage: offline_render.py INPUT OUTPUT.wav [--profile game|movie] [--bypass]
+usage: offline_render.py INPUT OUTPUT.wav [--profile game|movie|music] [--bypass]
                          [--seconds N] [--no-model] [--upmix]
 
 The input is decoded by ffmpeg into the plugin's 7.1 layout, so a stereo file

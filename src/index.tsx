@@ -3,7 +3,7 @@ import { ButtonItem, DropdownItem, PanelSection, PanelSectionRow, ToggleField, s
 import { useEffect, useState } from "react";
 import { FaHeadphones } from "react-icons/fa";
 
-type Mode = "off" | "game" | "movie";
+type Mode = "off" | "game" | "movie" | "music";
 type Device = "headphones" | "speakers" | "glasses";
 type InstallStatus = { phase?: "running" | "done" | "error"; step?: string; error?: string };
 
@@ -71,7 +71,7 @@ function syncForegroundApp() {
   });
 }
 
-const labels: Record<Mode, string> = { off: "Выключено", game: "Игра", movie: "Кино" };
+const labels: Record<Mode, string> = { off: "Выключено", game: "Игра", movie: "Кино", music: "Музыка" };
 const eqLabels: Record<string, string> = {
   neutral: "Нейтрально", speech: "Речь", music: "Музыка", metal: "Метал", rock: "Рок",
   jazz: "Джаз", classical: "Классика", electronic: "Электроника", hiphop: "Хип-хоп",
@@ -83,6 +83,7 @@ const descriptions: Record<Mode, string> = {
   off: "Звук идёт без изменений.",
   game: "Точное направление звуков, маленькая комната, динамика не трогается.",
   movie: "Диалоги громче и в центре, громкие сцены сглажены, комната больше.",
+  music: "Широкая сцена без нажима: голос не выделяется, динамика не трогается. Автоэквалайзер уточняет жанр.",
 };
 
 const sources: Record<string, string> = {
@@ -148,6 +149,7 @@ function Content() {
     { data: "off", label: labels.off },
     { data: "game", label: labels.game },
     { data: "movie", label: labels.movie },
+    { data: "music", label: labels.music },
   ];
   const load = live?.avg_ms !== undefined ? Math.round((live.avg_ms / BUDGET_MS) * 100) : undefined;
   let eqDescription = "Мягко подстраивает звучание под речь и музыку.";
